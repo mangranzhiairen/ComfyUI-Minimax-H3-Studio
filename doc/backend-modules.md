@@ -13,7 +13,8 @@ studio/
 ├── http_routes.py          # /minimax/studio/* HTTP 路由（素材列表 + 任务库 CRUD）
 ├── payload.py              # 数据契约（StudioPayload/ClipPayload）反序列化 + 校验
 ├── executor.py             # StudioExecutor：编排「采样-解码分离」流水线
-├── tasks/                  # 任务子类：base.py 模板方法 + t2v/i2v/fl2v/r2v/v2v/rv2v
+├── tasks/                  # 任务子类：__init__.py（TASK_REGISTRY + create_task 工厂）
+│                           #          base.py 模板方法 + t2v/i2v/fl2v/r2v/v2v/rv2v 六子类
 ├── sampling.py             # 官方 MiniMax H3 真实采样链路（conditioning → KSampler → 解码）
 ├── motion_context.py       # 段间引导：上一段 latent 尾部钉入 + 相位网格
 ├── segment_cache.py        # SQLite 任务库 + latent/preview 文件 + 两级指纹
@@ -24,7 +25,7 @@ studio/
 
 关键原则：
 
-- **前端权威执行 + DB 纯持久化**：执行器读到的 payload 由前端 Queue 时实时构建并随节点 widget（`timeline_data` JSON）传入，**执行不读 DB**；DB（SQLite）只做任务/历史的持久化记录。
+- **前端权威执行 + DB 纯持久化**：执行器读到的 payload 由前端 Queue 时实时构建并随节点 widget（`timeline_data` JSON）传入——**时间线内容/执行参数不从 DB 读回**；DB（SQLite）只做任务/历史的持久化记录。注意：执行中锁定的 latent 校验（`get_sample_canvas`）与缓存命中（`get_sample_meta`）会读 DB 记录，但不会用 DB 里的时间线内容覆盖执行输入。
 - **数据契约单一入口**：`payload.load()` 严格校验结构（版本、模式、素材数量上限、指纹格式），不符即抛 `PayloadValidationError`，不做历史形态兼容。
 - **采样-解码分离**：逐段采样只产出 AV latent 并写盘（指纹命名、内存零驻留），任务末尾统一从磁盘加载解码、流式合并成片。
 - **模型由 ComfyUI 管理**：本插件不加载/不卸载模型，只经 `TaskContext` 持有引用；`unload_models_after` 仅是采样完成后调用 `model_management.free_memory` 提前腾显存。
@@ -50,7 +51,7 @@ studio/
 
 - `sampleFp`：抽卡级反悔——锁定某次历史采样，Queue 时该段跳过采样直接用该 latent 出片（16 位 hex 校验）。
 - `continuity`：段间续接开关（本段把上一段 latent 尾部钉入）。
-- 校验清单：段数/模式白名单/素材数量上限（图 9、视频 3、音频 3）等。
+- 校验清单：clips **至少 1 段**（空时间线拒绝）、模式白名单（t2v/i2v/fl2v/r2v/v2v/rv2v）、时长范围 **1.0–30.0s**（`MIN/MAX_DURATION_SEC`）、素材数量上限（图 9、视频 3、音频 3）、`sampleFp` 16 位 hex 格式等。
 
 辅助：
 
@@ -185,7 +186,7 @@ output/minimax_h3_studio/{node_id}/preview_{sample_fp}.webp
 
 ### 节点（nodes/studio_console.py）
 
-`MiniMaxH3StudioConsole`（CATEGORY=MiniMaxH3，注册键主键；另保留旧注册键的双映射以兼容早期工作流 json，加载后显示新名）：
+`MiniMaxH3StudioConsole`（CATEGORY=MiniMaxH3，注册键见 `__init__.py` 的 `NODE_CLASS_MAPPINGS`，当前仅此一个注册项）：
 
 - widgets：`timeline_data`（隐藏 STRING，前端自动填 `{taskId, payload}`）、seed/steps/cfg/sampler/scheduler/shift_video/shift_audio/unload_models_after、`studio_console_ui`（内嵌面板）。
 - optional inputs：model / video_vae / audio_vae（r2v/v2v/rv2v 需要）/ clip（type=minimax）。缺 model/video_vae/clip 返回占位输出并回显错误。
