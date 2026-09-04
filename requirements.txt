@@ -1,0 +1,5 @@
+# MiniMax H3 创意工作台 云服务器依赖
+# opencv：视频素材解码
+opencv-python-headless
+# imageio-ffmpeg：音频解码（ffmpeg）
+imageio-ffmpeg

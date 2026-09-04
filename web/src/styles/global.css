@@ -1,0 +1,56 @@
+:root {
+  --dc-bg: #0f172a;
+  --dc-panel: #1e293b;
+  --dc-panel-hover: #243349;
+  --dc-border: #334155;
+  --dc-border-strong: #475569;
+  --dc-accent: #38bdf8;
+  --dc-accent-hover: #7dd3fc;
+  --dc-accent-dim: rgba(56, 189, 248, 0.12);
+  --dc-text: #e2e8f0;
+  --dc-text-dim: #94a3b8;
+  --dc-text-faint: #64748b;
+  --dc-danger: #f87171;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--dc-bg);
+  color: var(--dc-text);
+  font-family:
+    "Inter", "PingFang SC", "Microsoft YaHei", system-ui, -apple-system, sans-serif;
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 时间线横向滚动条 */
+.dc-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: var(--dc-border-strong) transparent;
+}
+.dc-scroll::-webkit-scrollbar {
+  height: 10px;
+  width: 10px;
+}
+.dc-scroll::-webkit-scrollbar-thumb {
+  background: var(--dc-border-strong);
+  border-radius: 5px;
+}
+.dc-scroll::-webkit-scrollbar-thumb:hover {
+  background: #5b6b83;
+}
+.dc-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* 拖拽时禁用文本选择 */
+.dc-no-select {
+  user-select: none;
+  -webkit-user-select: none;
+}

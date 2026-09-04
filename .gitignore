@@ -1,0 +1,28 @@
+.agents/
+
+# Node / 前端依赖与构建产物
+node_modules/
+web/node_modules/
+web/dist/
+
+# 打包产物
+dist_package/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Vite / 编辑器临时文件
+.vite/
+*.local
+.DS_Store
+Thumbs.db
+
+# 日志
+*.log
+npm-debug.log*
+
+
+# Agent/AI 协作文档（仅本地，不进发布仓库）
+/AGENT.md
