@@ -1,5 +1,11 @@
-# MiniMax H3 创意工作台 云服务器依赖
-# opencv：视频素材解码
-opencv-python-headless
-# imageio-ffmpeg：音频解码（ffmpeg）
-imageio-ffmpeg
+# MiniMax H3 创意工作台 —— 无额外 Python 依赖
+#
+# 视频/音频解码已改用 PyAV（`av`），它是 ComfyUI 本体的硬依赖
+# （ComfyUI/requirements.txt 里的 `av>=17.0.0`），因此本插件不需要任何
+# 额外 pip 安装，Release 包解压 / 源码克隆后开箱即用。
+#
+# 历史：早期版本依赖 opencv-python-headless（视频）与 imageio-ffmpeg（音频），现已移除。
+# 视频与旧 OpenCV 实现实测逐帧完全一致（10-bit 源除外，仅像素转换策略不同）；
+# 音频同时修掉了旧实现未解交错、把时间轴切成两半当左右声道的 bug。
+#
+# 本文件保留为空声明，便于 ComfyUI-Manager 等工具识别「本插件不引入额外依赖」。

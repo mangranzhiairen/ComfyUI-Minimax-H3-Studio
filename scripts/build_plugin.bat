@@ -75,7 +75,7 @@ echo   Packed: %ZIP%
 echo.
 echo Publish notes:
 echo   - Upload the zip above to a GitHub Release; users unzip into ComfyUI\custom_nodes\ to run (frontend included).
-echo   - Deps: pip install -r custom_nodes\ComfyUI-MiniMaxH3-Studio\requirements.txt
+echo   - Deps: none. Video/audio decode uses ComfyUI's bundled PyAV (av); no pip step needed.
 echo   - Do NOT release after source changes without rebuilding (frontend/backend version mismatch).
 exit /b 0
 

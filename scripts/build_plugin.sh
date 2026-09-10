@@ -84,5 +84,5 @@ fi
 echo
 echo "发布/部署说明："
 echo "  - 将上方 zip 传到 GitHub Releases 附件，用户解压到 ComfyUI/custom_nodes/ 即装即用（前端已含）。"
-echo "  - 依赖安装：pip install -r custom_nodes/$TOP/requirements.txt"
+echo "  - 依赖：无。视频/音频解码走 ComfyUI 自带的 PyAV（av），无需 pip 安装。"
 echo "  - 若源码变更后未重新构建，请勿发布（前端会与后端版本不符）。"

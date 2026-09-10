@@ -60,6 +60,8 @@
 ## 安装
 
 > 仓库**只提交源码，不含前端构建产物**（`web/dist/`，ComfyUI 运行时加载的是构建后的前端）。两种方式任选，**普通用户用方式 A**。
+>
+> 两种方式都**不需要额外 pip 依赖**：视频/音频解码走 ComfyUI 自带的 PyAV（`av`），解压 / 构建完直接重启即可。
 
 ### 方式 A：Release 安装（推荐，免构建）
 
@@ -78,9 +80,6 @@ cd ComfyUI-MiniMaxH3-Studio
 
 # 2. 构建前端（产出 web/dist）
 cd web && npm install && npm run build && cd ..
-
-# 3. 安装后端可选依赖（素材视频/音频解码）
-pip install -r requirements.txt
 ```
 
 ### 安装后的共同步骤
