@@ -65,7 +65,7 @@
 
 ### 方式 A：Release 安装（推荐，免构建）
 
-下载最新版 [Releases](https://github.com/mangranzhiairen/ComfyUI-MiniMaxH3-Studio/releases) 构件 zip（已含前端），解压到 `ComfyUI/custom_nodes/`：
+下载最新版 [Releases](https://github.com/mangranzhiairen/ComfyUI-Minimax-H3-Studio/releases) 构件 zip（已含前端），解压到 `ComfyUI/custom_nodes/`：
 
 ```bash
 unzip ComfyUI-MiniMaxH3-Studio_v*.zip -d <ComfyUI>/custom_nodes/
@@ -75,8 +75,8 @@ unzip ComfyUI-MiniMaxH3-Studio_v*.zip -d <ComfyUI>/custom_nodes/
 
 ```bash
 # 1. 克隆到 custom_nodes/
-git clone https://github.com/mangranzhiairen/ComfyUI-MiniMaxH3-Studio.git
-cd ComfyUI-MiniMaxH3-Studio
+git clone https://github.com/mangranzhiairen/ComfyUI-Minimax-H3-Studio.git
+cd ComfyUI-Minimax-H3-Studio
 
 # 2. 构建前端（产出 web/dist）
 cd web && npm install && npm run build && cd ..
