@@ -108,17 +108,52 @@ cd web && npm install && npm run build && cd ..
 ### 目录结构
 
 ```
+├── VERSION                  # 版本号单一来源（后端/前端/打包都从它派生）
 ├── __init__.py              # 节点注册 + WEB_DIRECTORY(web/dist) + HTTP 路由
 ├── nodes/studio_console.py  # 创意工作台节点（INPUT_TYPES + execute）
 ├── studio/                  # 后端：执行器 / 任务 / 采样 / 数据层 / 路由 / 预览
 ├── web/                     # 前端：Vue 3 + TS + Vite + Naive UI + Pinia
 ├── doc/                     # 模块级文档（后端 / 前端）
 ├── scripts/build_plugin.{bat,sh}  # 一键打包脚本（Windows / Linux·macOS）
+├── scripts/bump_version.py  # 升版本（写入 VERSION 并派生 npm 元数据）
+├── scripts/check_version.py # 版本一致性校验（发版门禁）
 ├── tests/test_studio.py     # 后端单测（无需 ComfyUI 环境）
 └── assets/screenshots/      # README 功能截图
 ```
 
 模块级说明见 [`doc/`](doc/)：[后端](doc/backend-modules.md) · [前端](doc/frontend-modules.md)。
+
+### 版本号管理
+
+版本号**只在仓库根 `VERSION` 文件里手写一次**，其余全部派生：
+
+| 消费方 | 何时读 | 怎么读 |
+|---|---|---|
+| 后端 `/minimax/studio/version` | 运行时 | `studio/version.py` 读 VERSION（随 Release 包分发） |
+| 前端 `__STUDIO_VERSION__` | 构建时 | `web/vite.config.ts` 读 VERSION 注入 |
+| dev 预览 mock | dev server | 由 `web/vite.config.ts` 传参注入（mockPlugin 不自读） |
+| Release zip 命名 | 打包时 | `scripts/build_plugin.*` 读 VERSION |
+| `web/package.json` + lock | npm 元数据 | 由 bump 脚本派生，**不手改** |
+
+> 不要用 `npm version` 改版本 —— 它只更新 package.json/lock，不会动 `VERSION`，
+> 会立刻造成漂移。升版本一律走 `bump_version.py`。
+
+### 发版流程
+
+```bash
+python scripts/bump_version.py 0.1.2    # 1. 升版本（写 VERSION + 派生 npm 元数据 + 自校验）
+scripts\build_plugin.bat                # 2. 构建前端 + 打包（zip 名与产物版本取自 VERSION）
+python scripts/check_version.py         # 3. 发布门禁：必须全部 [OK] 才传 Release
+```
+
+第 3 步会挡住「改了版本号但没重新构建前端」的情况 —— 那会让包里的前后端版本不一致，
+而这个版本自检正是防「浏览器缓存旧 JS 把空时间线写进工作流 json」的数据保护
+（详见[前端模块文档](doc/frontend-modules.md)），漂移等于保护失效。
+
+### 清理过期构建产物
+
+`dist_package/` 会累积每次打包的 zip（已 gitignore），传 Release 前确认拿的是最新那个；
+历史包建议随手删掉，避免误传。
 
 ### 本地开发
 

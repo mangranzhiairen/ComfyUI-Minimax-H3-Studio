@@ -42,7 +42,7 @@ Queue ── serializeValue 实时构建 {taskId, payload} ──→ timeline_da
 - **唯一状态源**：Pinia `timeline` store 持有时间线全部状态；组件不各自维护数据。
 - **自动保存**：main.ts 里 `$onAction` 订阅 store 的外部编辑 action（跳过 INTERNAL_ACTIONS 集合，防止回调内再触发递归），100ms 防抖后 `saveToDb()`；**无 taskId 时不保存**（`saveToDb` 内部 `if (!taskId) return false`），需用户显式新建/加载任务后才开始落库——工具栏「＋ 片段」在未选任务时会先弹新建任务对话框，建成功后再添加。
 - **widget 同步**：`$subscribe` 监听 state 变化把 `taskId` 同步到 widget；工作流 json 只存 `{taskId, payload?}`。
-- **版本自检**：构建时注入 `__STUDIO_VERSION__`（web/package.json version），运行时与后端 `/minimax/studio/version` 比对，不一致时在控制台 `console.warn` 提示强刷浏览器（旧 JS 会把空时间线写进工作流 json 造成数据丢失）；仅日志提示，不做强制刷新。
+- **版本自检**：构建时注入 `__STUDIO_VERSION__`（来源为仓库根 `VERSION` 文件，见 `web/vite.config.ts`），运行时与后端 `/minimax/studio/version`（`studio/version.py` 读同一个 `VERSION`）比对，不一致时在控制台 `console.warn` 提示强刷浏览器（旧 JS 会把空时间线写进工作流 json 造成数据丢失）；仅日志提示，不做强制刷新。版本号只手写一处，升版本用 `python scripts/bump_version.py <版本>`。
 - **切换任务前先保存**（Toolbar）：`saveToDb() → loadTask(nextId)`。
 
 ## 4. store 与契约（stores/timeline.ts + types/timeline.ts）

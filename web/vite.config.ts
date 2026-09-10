@@ -6,11 +6,17 @@ import { fileURLToPath, URL } from "node:url";
 import { readFileSync } from "node:fs";
 import { minimaxStudioDevMock } from "./src/dev/mockPlugin.ts";
 
-// 插件版本（读 package.json，注入构建产物；前端运行时与后端 /version 对比做缓存自检）
-const pkg = JSON.parse(
-  readFileSync(fileURLToPath(new URL("./package.json", import.meta.url)), "utf-8"),
-) as { version?: string };
-const PLUGIN_VERSION = pkg.version ?? "0.0.0";
+// 插件版本单一来源：仓库根目录 VERSION（注入构建产物；前端运行时与后端 /version 对比做缓存自检）
+// 升版本请用 scripts/bump_version.py，勿手改；一致性由 scripts/check_version.py 校验。
+let PLUGIN_VERSION = "0.0.0";
+try {
+  PLUGIN_VERSION = readFileSync(
+    fileURLToPath(new URL("../VERSION", import.meta.url)),
+    "utf-8",
+  ).trim();
+} catch {
+  // VERSION 缺失（例如只拷贝了 web/ 目录）时保持兜底值，构建不因此失败
+}
 
 // 集成交互模式：dev / preview 均为浏览器独立预览（不依赖 ComfyUI）
 // 构建模式：build --mode lib 产出挂载进 ComfyUI 节点的单文件脚本
@@ -68,7 +74,8 @@ export default defineConfig(({ mode }) => {
     plugins: [
       ...commonPlugins,
       // dev-only mock 后端：提供 /view、/minimax/studio/*、/upload 本地实现（见 mockPlugin）
-      minimaxStudioDevMock(),
+      // 版本由此处注入：mockPlugin 内部自读 VERSION 的相对路径在 config 被打包后会失效
+      minimaxStudioDevMock(PLUGIN_VERSION),
     ],
     resolve: {
       alias: {

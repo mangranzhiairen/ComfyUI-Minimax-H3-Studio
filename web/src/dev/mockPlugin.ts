@@ -211,7 +211,7 @@ function route(method: string, pattern: string, handle: Handler): void {
 // ---- 任务库 ----
 
 route("GET", "/minimax/studio/version", async (_p, _req, res) => {
-  json(res, 200, { version: "0.1.0" });
+  json(res, 200, { version: pluginVersion });
 });
 
 route("POST", "/minimax/studio/tasks", async (_p, req, res) => {
@@ -631,7 +631,13 @@ function serveView(res: Res, url: URL): void {
 
 // ---------- vite 插件 ----------
 
-export function minimaxStudioDevMock(): Plugin {
+/**
+ * @param pluginVersion 插件版本（由 vite.config.ts 从仓库根 VERSION 读出后注入）。
+ *   不要在本文件里自行按相对路径读 VERSION：vite 会把配置文件及其本地 import
+ *   打包成临时文件再执行，`import.meta.url` 届时指向 `web/` 下的临时文件而非本源文件，
+ *   多级相对路径会静默解析到错误位置。统一由调用方传入。
+ */
+export function minimaxStudioDevMock(pluginVersion = "0.0.0"): Plugin {
   return {
     name: "minimax-h3-studio-dev-mock",
     configureServer(server) {

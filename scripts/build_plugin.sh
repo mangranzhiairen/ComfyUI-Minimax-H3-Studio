@@ -7,7 +7,8 @@
 #   bash scripts/build_plugin.sh --no-build # 跳过前端构建（复用已有 web/dist）
 #
 # 产物：dist_package/ComfyUI-MiniMaxH3-Studio_v{version}_{时间戳}.zip
-# 内容：仅运行时必需 —— __init__.py、nodes/、studio/、requirements.txt、web/dist
+# 内容：仅运行时必需 —— __init__.py、nodes/、studio/、requirements.txt、VERSION、web/dist
+# 版本：来自仓库根目录 VERSION（单一来源；升版本用 scripts/bump_version.py，勿手改）
 # 依赖：node + npm（构建前端需要）、zip 命令（无则回退 tar.gz 并提示）
 #
 set -euo pipefail
@@ -18,12 +19,13 @@ cd "$ROOT"
 NO_BUILD=0
 if [ "${1:-}" = "--no-build" ]; then NO_BUILD=1; fi
 
-# ---------- 读版本 ----------
-if [ -f web/package.json ] && command -v node >/dev/null 2>&1; then
-  VERSION="$(node -e "console.log(require('./web/package.json').version || '0.0.0')")"
+# ---------- 读版本（仓库根 VERSION，单一来源）----------
+if [ -f "$ROOT/VERSION" ]; then
+  VERSION="$(tr -d '[:space:]' < "$ROOT/VERSION")"
 else
   VERSION="0.0.0"
 fi
+VERSION="${VERSION:-0.0.0}"
 STAMP="$(date +%Y%m%d_%H%M%S)"
 OUT_DIR="$ROOT/dist_package"
 ZIP="$OUT_DIR/ComfyUI-MiniMaxH3-Studio_v${VERSION}_${STAMP}.zip"
@@ -56,6 +58,8 @@ mkdir -p "$PKG/web" "$PKG/nodes" "$PKG/studio"
 
 cp "$ROOT/__init__.py" "$PKG/"
 cp "$ROOT/requirements.txt" "$PKG/"
+# 版本单一来源：后端 studio/version.py 运行时读它，必须随包分发
+cp "$ROOT/VERSION" "$PKG/"
 
 # nodes/ 全量（排除 __pycache__）
 (cd "$ROOT" && find nodes -type f ! -path '*/__pycache__/*' | while read -r f; do

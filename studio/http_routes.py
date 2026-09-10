@@ -10,6 +10,8 @@ from aiohttp import web
 
 import folder_paths
 
+from .version import PLUGIN_VERSION
+
 log = logging.getLogger("ComfyUI-MiniMaxH3-Studio")
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".avif", ".jfif"}
@@ -110,10 +112,10 @@ async def list_input_media(request: web.Request) -> web.Response:
 
 # ---------- 任务库 CRUD（时间线唯一数据源在 SQLite） ----------
 
-# 插件版本（与 web/package.json 的 version 同步维护）。
+# 插件版本来自仓库根目录 VERSION（单一来源，见 .version / scripts/bump_version.py）。
 # 前端构建版本自检用：后端版本 ≠ 前端构建版本 → 浏览器缓存了旧版 minimax-h3-studio.js，
 # 需强制刷新/清缓存，否则旧 JS 会把完整空 payload 写进工作流 json（数据丢失事故）。
-PLUGIN_VERSION = "0.1.0"
+__all__ = ["PLUGIN_VERSION", "get_plugin_version", "register_routes"]
 
 
 async def get_plugin_version(request: web.Request) -> web.Response:
