@@ -492,7 +492,16 @@ route("POST", "/upload/:kind", async ([kind], req, res) => {
   const filename = file.filename || `upload_${Date.now()}`;
   const lower = kind.toLowerCase();
   const mime = file.mime || (lower === "image" ? "image/png" : lower === "video" ? "video/mp4" : "audio/wav");
-  state.input.set(filename, { data: file.data, mime, kind: lower });
+  // 真实后端统一收 /upload/image，素材类型靠扩展名/MIME 判定（URL 段不再区分 kind），
+  // mock 保持一致：优先按 MIME 归类，避免视频/音频被记成 image 而在「选已有」里丢失。
+  const inferred = mime.startsWith("video/")
+    ? "video"
+    : mime.startsWith("audio/")
+      ? "audio"
+      : mime.startsWith("image/")
+        ? "image"
+        : lower;
+  state.input.set(filename, { data: file.data, mime, kind: inferred });
   json(res, 200, { name: filename, subfolder: "", type: "input" });
 });
 

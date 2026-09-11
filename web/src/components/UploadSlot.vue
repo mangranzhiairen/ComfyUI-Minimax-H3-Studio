@@ -67,7 +67,11 @@ async function uploadFile(file: File): Promise<{ path: string; preview?: string 
   }
 
   const api = (window as { app?: { api: { fetchApi: (url: string, init?: RequestInit) => Promise<Response> } } }).app!.api!;
-  const endpoint = props.kind === "image" ? "/upload/image" : props.kind === "video" ? "/upload/video" : "/upload/audio";
+  // ComfyUI 核心只注册了 POST /upload/image（与 /upload/mask），/upload/video|audio 并不存在：
+  // 这类未注册路径会落进静态文件路由（仅 GET/HEAD）→ 405 Method Not Allowed。
+  // /upload/image 是通用文件落盘接口（不校验图片格式，官方前端上传视频/音频也走它），
+  // 素材类型判定由后端按扩展名完成，因此三种 kind 统一走这里。
+  const endpoint = "/upload/image";
   const body = new FormData();
   body.append("image", file, file.name);
   body.append("type", "input");
