@@ -1,4 +1,4 @@
-﻿import { defineStore } from "pinia";
+import { defineStore } from "pinia";
 import {
   type CanvasConfig,
   type StudioPayload,
@@ -14,6 +14,30 @@ import {
 /** 生成片段 id（避免与随机碰撞） */
 function createId(): string {
   return `clip_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/** ---------- 会话内时间线快照（切工作流 tab / 写库失败时的兜底） ----------
+ *  时间线唯一持久源仍是 SQLite；这里只做「同一浏览器会话内」的内存兜底：
+ *  - 切工作流 tab（节点销毁重建）或写库未落地/失败时，恢复走这份快照，
+ *    保证「正在编辑、还没采样过的提示词」不会因为换 tab 而丢。
+ *  - 键是 taskId 本身：恢复时已经确定要打开哪个任务，不存在张冠李戴。
+ *  - 页面刷新/关闭即失效（那时以 DB 为准）。 */
+const SESSION_SNAPSHOT_LIMIT = 20;
+const sessionTimelines = new Map<string, StudioPayload>();
+
+/** 记录某任务的时间线快照（落库前调用，覆盖式） */
+function rememberSessionTimeline(taskId: string, payload: StudioPayload): void {
+  sessionTimelines.delete(taskId); // 重插 → Map 迭代顺序按最近使用排列
+  sessionTimelines.set(taskId, payload);
+  while (sessionTimelines.size > SESSION_SNAPSHOT_LIMIT) {
+    const oldest = sessionTimelines.keys().next().value;
+    if (oldest === undefined) break;
+    sessionTimelines.delete(oldest);
+  }
+}
+
+function sessionTimelineOf(taskId: string): StudioPayload | null {
+  return sessionTimelines.get(taskId) ?? null;
 }
 
 /** ComfyUI fetchApi（自动加 /api 前缀） */
@@ -37,6 +61,19 @@ export const useTimelineStore = defineStore("timeline", {
     zoom: 64 as number,
     /** 当前加载的任务 id（任务库模式：时间线唯一数据源在 SQLite，工作流 json 只存此 id） */
     taskId: null as string | null,
+    /** ★ 时间线**已就绪**的任务 id：只有 loadTask 成功（或新建任务）后才等于 taskId。
+     *  不变式 I2：未就绪时禁止把（此刻还空着的）clips 写回 DB —— 切 tab 后恢复期间
+     *  任何保存（含面板挂载时 setZoom 触发的防抖保存）都会用空时间线覆盖 DB。 */
+    loadedTaskId: null as string | null,
+    /** ★ 用户显式卸载/删除任务时为 true：只有此时才允许清空工作流载体里的 taskId。
+     *  不变式 I1 的载体侧：瞬时 taskId=null 绝不写空载体（否则工作流永久失绑）。 */
+    bindingReleased: false as boolean,
+    /** 最近一次任务加载失败（网络/5xx/超时，非"任务不存在"）：内容仍保留本地，UI 可提示 */
+    loadFailed: false as boolean,
+    /** 最近一次落库失败（网络/服务异常）：UI 可提示"改动还在内存里，尚未写入 DB" */
+    saveFailed: false as boolean,
+    /** 任务在服务端确实不存在（404，跨机工作流/库被清）：只有这种情况才回未加载态 */
+    taskMissing: false as boolean,
     /** 当前任务可读名称（列表/标题展示） */
     taskName: "" as string,
     /** 所属 ComfyUI 节点 id（创建任务用） */
@@ -180,6 +217,8 @@ export const useTimelineStore = defineStore("timeline", {
 
     setTaskId(taskId: string | null): void {
       this.taskId = taskId;
+      // 重新绑定任务 → 载体可继续写（清掉"显式卸载"标记）
+      if (taskId) this.bindingReleased = false;
     },
 
     setNodeId(nodeId: string): void {
@@ -193,12 +232,16 @@ export const useTimelineStore = defineStore("timeline", {
       this.selectedId = null;
       this.historyByClipId = {}; // 新任务无历史
       const tid = await this.createTask(nodeId, name);
-      if (tid) await this.saveToDb(); // DB 里始终有合法 payload（避免 executor 读到空时间线）
+      if (tid) {
+        this.loadedTaskId = tid; // 新任务：时间线就是空的，允许落库（合法的空写入）
+        await this.saveToDb(); // DB 里始终有合法 payload（避免 executor 读到空时间线）
+      }
       return tid;
     },
 
     /** 卸载当前任务（删除后回到"未加载任务"的待加载界面）：
-     *  清空时间线 + taskId，不创建任何新任务。 */
+     *  清空时间线 + taskId，不创建任何新任务。
+     *  bindingReleased=true 是**唯一**允许清空工作流载体的信号（I1 载体侧）。 */
     unloadTask(): void {
       this.clips = [];
       this.canvas = { fps: 24, width: 864, height: 480 };
@@ -207,35 +250,90 @@ export const useTimelineStore = defineStore("timeline", {
       this.taskName = "";
       this.historyByClipId = {};
       this.samplingProgress = null;
+      this.loadedTaskId = null;
+      this.loadFailed = false;
+      this.taskMissing = false;
+      this.bindingReleased = true;
     },
 
     /** 从 DB 加载任务：timeline（时间线当前数据 = canvas + clips[]，每 clip 含完整参数草稿）。
-     *  片段当前数据独立于历史（草稿不丢，崩溃/刷新恢复）；历史版本仅作反悔来源。 */
+     *  片段当前数据独立于历史（草稿不丢，崩溃/刷新恢复）；历史版本仅作反悔来源。
+     *
+     *  ★ 失败语义（切工作流 tab 会高频走这里，必须严格区分，否则一次抖动 = 丢数据）：
+     *    - 404（任务在本地库确实不存在）→ taskMissing=true 且返回 false，由调用方决定回未加载态
+     *    - 其它失败（网络/5xx/超时/响应非法）→ loadFailed=true 且返回 false，
+     *      **绝不清空当前内存时间线**（调用方不得再调 unloadTask：那里是正在编辑的草稿）
+     *
+     *  ★ 不变式 I1（空不覆盖非空）：DB 读到空时间线、而本地/会话快照有该任务内容时，
+     *    保留非空内容并回写 DB —— 本地才是用户正在编辑的那一份。 */
     async loadTask(taskId: string): Promise<boolean> {
+      this.loadFailed = false;
+      this.taskMissing = false;
+
+      let res: Response;
       try {
-        const res = await fetchApi(`/minimax/studio/tasks/${encodeURIComponent(taskId)}`);
-        if (!res.ok) return false;
-        const data = await res.json();
-        let seq: {
-          canvas?: CanvasConfig;
-          clips?: Record<string, unknown>[];
-        } = {};
-        try {
-          seq = JSON.parse(data.timeline || "{}");
-        } catch {
-          seq = {};
-        }
-        if (seq.canvas) this.canvas = { ...seq.canvas };
-        // 直接恢复每 clip 的当前参数草稿（timeline 是权威，不指向历史）
-        this.clips = (seq.clips ?? []).map((c) => fromClipPayload(c as unknown as ClipPayload));
-        this.selectedId = this.clips[0]?.id ?? null;
-        this.taskId = taskId;
-        this.taskName = data.name ?? "";
-        await this.fetchHistory(); // 历史（纯 Model）拉取，供反悔展示
-        return true;
+        res = await fetchApi(`/minimax/studio/tasks/${encodeURIComponent(taskId)}`);
       } catch {
+        this.loadFailed = true;
         return false;
       }
+      if (res.status === 404) {
+        this.taskMissing = true;
+        return false;
+      }
+      if (!res.ok) {
+        this.loadFailed = true;
+        return false;
+      }
+
+      let data: { name?: string; timeline?: string };
+      try {
+        data = (await res.json()) as { name?: string; timeline?: string };
+      } catch {
+        this.loadFailed = true;
+        return false;
+      }
+
+      let seq: {
+        canvas?: CanvasConfig;
+        clips?: Record<string, unknown>[];
+      } = {};
+      try {
+        seq = JSON.parse(data.timeline || "{}");
+      } catch {
+        seq = {};
+      }
+
+      const incoming = (seq.clips ?? []).map((c) => fromClipPayload(c as unknown as ClipPayload));
+      // 兜底来源优先级：本地已就绪的同任务内容 > 本会话快照
+      const localReady = this.loadedTaskId === taskId && this.clips.length > 0;
+      const cached = sessionTimelineOf(taskId);
+      if (incoming.length === 0 && (localReady || (cached?.clips.length ?? 0) > 0)) {
+        const fallback = localReady ? this.clips : (cached as StudioPayload).clips.map(fromClipPayload);
+        if (seq.canvas) this.canvas = { ...seq.canvas };
+        else if (!localReady && cached) this.canvas = { ...cached.canvas };
+        this.clips = fallback;
+        this.selectedId = this.clips[0]?.id ?? null;
+        this.taskId = taskId;
+        this.loadedTaskId = taskId;
+        this.taskName = data.name ?? "";
+        console.warn(
+          `[StudioConsole] 任务 ${taskId} 的 DB 时间线为空，已保留本地/会话内容并回写（防空覆盖非空）`,
+        );
+        void this.saveToDb(); // 修复 DB（此刻 loadedTaskId 已就绪，允许写）
+        await this.fetchHistory();
+        return true;
+      }
+
+      if (seq.canvas) this.canvas = { ...seq.canvas };
+      // 直接恢复每 clip 的当前参数草稿（timeline 是权威，不指向历史）
+      this.clips = incoming;
+      this.selectedId = this.clips[0]?.id ?? null;
+      this.taskId = taskId;
+      this.loadedTaskId = taskId;
+      this.taskName = data.name ?? "";
+      await this.fetchHistory(); // 历史（纯 Model）拉取，供反悔展示
+      return true;
     },
 
     /** 打开/关闭「从历史恢复片段」面板（UI 状态，跨组件共享入口） */
@@ -512,15 +610,28 @@ export const useTimelineStore = defineStore("timeline", {
     },
 
     /** 保存时间线当前数据到 DB：canvas + clips[]（每 clip 完整参数草稿，覆盖式自动保存）。
-     *  片段当前数据独立于历史（草稿不丢，崩溃/刷新恢复）；历史版本由采样固化。 */
+     *  片段当前数据独立于历史（草稿不丢，崩溃/刷新恢复）；历史版本由采样固化。
+     *
+     *  ★ 不变式 I2（未就绪不得回写）：切工作流 tab 后 store 会短暂处于
+     *    「taskId 已设、clips 还空」的恢复窗口，此时任何保存都会用空时间线覆盖 DB
+     *    （实测：面板挂载时 setZoom 触发的防抖保存即可在 100ms 内清空整个任务）。
+     *    因此只有 loadedTaskId === taskId（时间线已就绪）才允许写库。 */
     async saveToDb(): Promise<boolean> {
       if (!this.taskId) return false;
+      if (this.loadedTaskId !== this.taskId) return false; // 恢复未完成：拒绝写库（防空覆盖）
       const seq = {
         version: 1,
         canvas: { ...this.canvas },
         clips: this.clips.map((c) => toClipPayload(c)),
         totalDurationSec: this.totalDurationSec,
       };
+      // 会话内快照：先记后发 —— 写库失败/被清空时仍能兜底恢复（I1 的内存侧）
+      rememberSessionTimeline(this.taskId, {
+        version: 1,
+        canvas: { ...this.canvas },
+        clips: this.clips.map((c) => toClipPayload(c)),
+        totalDurationSec: this.totalDurationSec,
+      });
       try {
         const res = await fetchApi(
           `/minimax/studio/tasks/${encodeURIComponent(this.taskId)}/timeline`,
@@ -530,8 +641,13 @@ export const useTimelineStore = defineStore("timeline", {
             body: JSON.stringify({ timeline: JSON.stringify(seq) }),
           },
         );
+        // 失败可见：改动仍在内存（并有会话快照兜底），但用户需要知道还没落库
+        this.saveFailed = !res.ok;
+        if (!res.ok) console.error(`[StudioConsole] 时间线落库失败（HTTP ${res.status}）：改动仍在本地`);
         return res.ok;
-      } catch {
+      } catch (err) {
+        this.saveFailed = true;
+        console.error("[StudioConsole] 时间线落库失败（网络异常）：改动仍在本地", err);
         return false;
       }
     },
@@ -555,6 +671,7 @@ export const useTimelineStore = defineStore("timeline", {
           `/minimax/studio/tasks/${encodeURIComponent(taskId)}`,
           { method: "DELETE" },
         );
+        if (res.ok) sessionTimelines.delete(taskId); // 任务没了，会话快照一并清掉
         return res.ok;
       } catch {
         return false;

@@ -36,14 +36,27 @@ web/src/
 ```
 编辑（store）── $onAction 订阅（main.ts，防抖 100ms）──→ saveToDb（写 tasks.timeline）
 Queue ── serializeValue 实时构建 {taskId, payload} ──→ timeline_data widget ──→ 后端 executor
-加载工作流 ── nodeCreated 读 widget → loadFromPayload（无 taskId 时为纯时间线模式）
+加载工作流 ── nodeCreated/loadedGraphNode 读载体 → loadTask（按 taskId 从 DB 拉时间线）
 ```
 
 - **唯一状态源**：Pinia `timeline` store 持有时间线全部状态；组件不各自维护数据。
 - **自动保存**：main.ts 里 `$onAction` 订阅 store 的外部编辑 action（跳过 INTERNAL_ACTIONS 集合，防止回调内再触发递归），100ms 防抖后 `saveToDb()`；**无 taskId 时不保存**（`saveToDb` 内部 `if (!taskId) return false`），需用户显式新建/加载任务后才开始落库——工具栏「＋ 片段」在未选任务时会先弹新建任务对话框，建成功后再添加。
-- **widget 同步**：`$subscribe` 监听 state 变化把 `taskId` 同步到 widget；工作流 json 只存 `{taskId, payload?}`。
+- **widget 同步**：`$subscribe` 监听 state 变化把 `taskId` 同步到 widget；工作流 json 只存 `{taskId}`（另在 `node.properties.studio_task_id` 冗余一份同值载体）。
 - **版本自检**：构建时注入 `__STUDIO_VERSION__`（来源为仓库根 `VERSION` 文件，见 `web/vite.config.ts`），运行时与后端 `/minimax/studio/version`（`studio/version.py` 读同一个 `VERSION`）比对，不一致时在控制台 `console.warn` 提示强刷浏览器（旧 JS 会把空时间线写进工作流 json 造成数据丢失）；仅日志提示，不做强制刷新。版本号只手写一处，升版本用 `python scripts/bump_version.py <版本>`。
 - **切换任务前先保存**（Toolbar）：`saveToDb() → loadTask(nextId)`。
+
+### 数据安全：两条硬不变式（I1 / I2）
+
+切工作流 tab 会销毁节点、再按快照重建；重建瞬间 store 处于「taskId 已设、clips 还空」的窗口，而面板挂载时的缩放适配（`Timeline.vue` `clampZoomToFit` → `setZoom`）等任何 action 都会触发防抖保存——历史上因此出现过两类数据事故，修复后由两条不变式守住：
+
+- **I1 空永不覆盖非空**：内存 store、DB（`saveToDb`）、工作流载体三处都适用。
+  - DB 读到空、而本地/会话快照有内容 → 保留非空并回写 DB（`loadTask` 内）；
+  - 载体侧：**只有用户显式卸载/删除任务**（`unloadTask` → `bindingReleased=true`）才允许把 widget/`properties.studio_task_id` 写空；瞬时 taskId=null（恢复窗口、加载失败）一律不动载体。
+- **I2 未就绪不得回写**：`loadedTaskId === taskId`（`loadTask` 成功或新建任务后才成立）才允许 `saveToDb()`；恢复期间的空 store 无权写库。
+- **加载失败宽容化**：`loadTask` 区分 404（任务确实不存在 → `taskMissing`，回未加载态）与网络/5xx（`loadFailed`，**绝不清空内存时间线**）；main.ts 退避重试 3 次（400/1200ms）。
+- **会话内兜底快照**：`saveToDb` 落库前把 payload 记入内存 Map（键 = taskId，上限 20）；DB 为空/写库失败时用它恢复，页面刷新即失效。
+- **恢复载体**：widget `{taskId}` → `node.properties.studio_task_id` → 旧版整包 payload；`nodeCreated` 后 400ms 再读一次兜时序（configure 回填 widget 值可能晚于 nodeCreated），`loadedGraphNode` 是权威入口；恢复幂等（已就绪/正在恢复则跳过）。
+- **生命周期**：节点销毁（切 tab）时先 `_stFlush()` 立刻落库、再取消未完成的恢复重试；每个节点持有自己的 pinia（模块级单例会在多 tab/多节点时串台）。
 
 ## 4. store 与契约（stores/timeline.ts + types/timeline.ts）
 
@@ -55,6 +68,8 @@ Queue ── serializeValue 实时构建 {taskId, payload} ──→ timeline_da
 | canvas | 全局画布 { fps, width, height } |
 | selectedId / zoom | 选中片段 / 时间线缩放（px 每秒） |
 | taskId / taskName / nodeId | 任务库模式（SQLite）上下文 |
+| loadedTaskId / bindingReleased | 数据安全守卫：时间线是否已就绪（I2）/ 是否用户显式卸载（I1 载体侧） |
+| loadFailed / taskMissing / saveFailed | 加载/落库异常可见化（工具栏 ⚠ 提示；内容始终保留本地） |
 | historyByClipId | 按 clip_id 索引的历史（versions + samples，由后端 history 接口拉取） |
 | samplingProgress | 当前采样片段的进度 + live 预览（executor 广播） |
 | showRestoreModal / showHistoryPanel | 跨组件 UI 弹窗开关 |
@@ -124,7 +139,7 @@ Queue ── serializeValue 实时构建 {taskId, payload} ──→ timeline_da
 | studio_clip_done | 单段采样完成 → 刷新该片段历史 |
 | executed | 整节点执行完成 → 清采样进度 + 刷新历史 |
 
-- widget 生命周期：`nodeCreated` 挂载面板与订阅（只绑一次）；`onRemove` 清理；工作流加载 `loadedGraphNode` 时序防御（_stRestoring 期间禁止覆盖 widget.value）。
+- widget 生命周期：`nodeCreated` 挂载面板与订阅（只绑一次）；`onRemove` 先 `_stFlush()` 落库、再取消恢复重试并清理订阅；工作流加载 `loadedGraphNode` 回调 `node._stRestore()`（与 nodeCreated 共用同一套恢复逻辑：双载体 + 幂等 + 失败重试 + 绝不清空）。每个节点持有独立 pinia，`node._stStopRestore / _stFlush / _stRestore` 挂在节点上随节点销毁。
 
 ## 9. 构建与开发
 

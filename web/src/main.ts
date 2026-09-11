@@ -1,4 +1,4 @@
-﻿/**
+/**
  * ComfyUI 节点集成入口（库模式构建，产出 minimax-h3-studio.js）
  *
  * 集成方式：照官方 Vue 示例 ComfyUI_frontend_vue_basic 的模式
@@ -45,6 +45,14 @@ interface ComfyLGraphNode {
   studioSync?: () => void;
   _stStopSync?: () => void;
   _stStopState?: () => void;
+  /** 节点属性（随工作流 json 序列化）：studio_task_id 作 taskId 的冗余载体 */
+  properties?: Record<string, unknown>;
+  /** 从载体恢复时间线绑定（nodeCreated 注册，loadedGraphNode 复用） */
+  _stRestore?: () => boolean;
+  /** 取消未完成的恢复重试（widget.onRemove 时调用） */
+  _stStopRestore?: () => void;
+  /** 立刻落库（切 tab 销毁节点前调用，保证草稿已写进 DB） */
+  _stFlush?: () => void;
   /** 事件监听已绑定标记（nodeCreated 可能多次触发，只绑一次） */
   _stEventsBound?: boolean;
   /** 事件监听清理函数（widget.onRemove 时调用） */
@@ -95,8 +103,9 @@ async function checkFrontendVersion(): Promise<void> {
   }
 }
 
-/** 模块级 pinia 单例：nodeCreated / loadedGraphNode 需要访问 store（作用域外） */
-let piniaInstance: ReturnType<typeof createPinia> | null = null;
+/** 模块级 pinia 单例已移除：每个节点持有自己的 pinia/store。
+ *  （模块级单例会在「两个工作流 tab 各有一个工作台节点」时被后建的节点覆盖，
+ *   导致 loadedGraphNode 的恢复落到另一个节点的 store 上。） */
 
 export interface StudioConsoleApi {
   mount: (container: HTMLElement, props?: Record<string, unknown>) => void;
@@ -107,12 +116,14 @@ export interface StudioConsoleApi {
   loadPayload: (payload: StudioPayload) => void;
   /** 订阅时间线数据变化（store action / state 变化时回调） */
   subscribe: (callback: () => void) => () => void;
+  /** 本节点专属的时间线 store（与 mount 的 Vue 应用同一个 pinia） */
+  getStore: () => ReturnType<typeof useTimelineStore>;
 }
 
 export function createStudioConsole(): StudioConsoleApi {
   let appInstance: ReturnType<typeof createApp> | null = null;
-  piniaInstance = createPinia();
-  const pinia = piniaInstance;
+  // 每个节点一个 pinia：组件与服务端恢复逻辑共用同一个 store，互不串台
+  const pinia = createPinia();
 
   return {
     mount(el: HTMLElement, props?: Record<string, unknown>) {
@@ -131,12 +142,17 @@ export function createStudioConsole(): StudioConsoleApi {
     loadPayload(payload: StudioPayload) {
       useTimelineStore(pinia).loadFromPayload(payload);
     },
+    getStore() {
+      return useTimelineStore(pinia);
+    },
     subscribe(callback: () => void) {
       const store = useTimelineStore(pinia);
       // $onAction 会监听 store 的【所有】action——包括我们回调里调用的
       // serialize / loadFromPayload / saveToDb 等。若不跳过，回调 → 保存 →
       // 再次触发 $onAction → after → 回调 → 无限递归爆栈。
       // 因此仅对外部操作型 action（add/remove/update/move 等）响应。
+      // 注意：纯 UI 动作（setZoom/select）不算数据变更，必须一并跳过——
+      // 否则面板挂载时的缩放适配会触发保存，在恢复未完成时把空时间线写回 DB。
       const INTERNAL_ACTIONS = new Set([
         "serialize",
         "loadFromPayload",
@@ -154,6 +170,8 @@ export function createStudioConsole(): StudioConsoleApi {
         "fetchHistory",
         "deleteClip",
         "setSamplingProgress",
+        "setZoom",
+        "select",
         "openRestoreModal",
         "closeRestoreModal",
         "openHistoryPanel",
@@ -198,6 +216,10 @@ function createVueWidget(node: ComfyLGraphNode) {
   consoleApi.mount(container);
 
   widget.onRemove = () => {
+    // 切工作流 tab 会销毁节点：先把待写的草稿落库（未就绪时 store 内部会拒绝），
+    // 再取消未完成的恢复重试，最后清理订阅/监听。
+    node._stStopRestore?.();
+    node._stFlush?.();
     consoleApi.destroy();
     node._stCleanup?.();
     node._stStopState?.();
@@ -257,7 +279,8 @@ app.registerExtension({
     // 必须在这里挂（nodeCreated 时 widget 才全部就绪），不能依赖组件 onMounted。
     if (!tw._stSynced) {
       tw._stSynced = true;
-      const store = useTimelineStore(piniaInstance!);
+      // 本节点专属 store（与 mount 的 Vue 应用同一 pinia，不随其它节点/其它 tab 串台）
+      const store = consoleApi.getStore();
 
       // 事件监听（节点级，闭包绑定本节点 store——setup 阶段 api/store 未就绪，必须在此注册）：
       // - studio_progress：executor 段级采样进度广播 → 卡片底部进度条
@@ -308,35 +331,46 @@ app.registerExtension({
       // MVC：saveToDb 只存时间线当前数据（canvas + clips[] 完整参数草稿，覆盖式自动保存），
       // 片段当前数据独立于历史；历史版本由采样固化（Model 纯历史）。
       // 不自动创建任务——无 taskId 时不保存（时间线留在内存，需用户新建任务后编辑）。
+      // ★ 真正的"防覆盖"守卫在 store.saveToDb（loadedTaskId 未就绪时拒绝写库）。
       let saveTimer: number | undefined;
+      const flushSave = () => {
+        // 节点即将销毁（切 tab）→ 立刻把草稿落库，不等防抖
+        if (saveTimer) {
+          window.clearTimeout(saveTimer);
+          saveTimer = undefined;
+        }
+        void store.saveToDb();
+      };
+      node._stFlush = flushSave;
       const scheduleSave = () => {
         const tid = store.taskId;
         if (saveTimer) window.clearTimeout(saveTimer);
         saveTimer = window.setTimeout(() => {
+          saveTimer = undefined;
           if (tid && store.taskId === tid) void store.saveToDb();
         }, 100);
       };
       const sync = () => {
         // widget.value = 只存任务 id（保存工作流时 json 里只有 taskId）
-        // - _stRestoring 期间（工作流恢复流程中）不覆盖 widget.value：ComfyUI 加载工作流时
-        //   把 json 里的值赋回 widget，时序在不同前端版本/浏览器缓存下可能晚于 nodeCreated；
-        //   若在此前先 sync（旧 store 无 taskId）会把已恢复的数据抹掉——旧版构建正是因此
-        //   在节点重建时把完整空 payload 写进 json，导致切回工作流时间线全部丢失。
-        // - 无 taskId 且 widget 里是旧版完整 payload（无 taskId 字段）时保留不清空：
-        //   作兼容载体（旧构建缓存/旧工作流），待用户新建/加载任务后升级为 taskId 格式。
+        // ★ 不变式 I1（载体侧）：只有"用户显式卸载/删除任务"才允许把载体写空。
+        //   瞬时 taskId=null（恢复窗口内 / 加载失败）一律不动载体——旧版正是因此
+        //   在恢复失败时把 taskId 写成空串，工作流从此永久失绑（切多少次都是空）。
         if (tw._stRestoring) return;
-        const next = store.taskId ? JSON.stringify({ taskId: store.taskId }) : "";
-        if (!next) {
-          try {
-            const existing = JSON.parse(typeof tw.value === "string" ? tw.value : "") as {
-              taskId?: string;
-            };
-            if (existing && !existing.taskId) return; // 旧版完整 payload：保留
-          } catch {
-            // 空字符串/非 JSON：正常清空
-          }
+        const tid = store.taskId;
+        if (!tid) {
+          if (!store.bindingReleased) return;
+          if (tw.value !== "") tw.value = "";
+          if (node.properties) delete node.properties.studio_task_id;
+          return;
         }
-        tw.value = next;
+        // 载体 A：widget（工作流 json 里唯一的时间线指针）
+        const next = JSON.stringify({ taskId: tid });
+        if (tw.value !== next) tw.value = next;
+        // 载体 B：node.properties 冗余一份（只在变化时写，不会因编辑把工作流标脏；
+        //  widget 被清 / configure 时序错位时兜底恢复）
+        if (node.properties && node.properties.studio_task_id !== tid) {
+          node.properties.studio_task_id = tid;
+        }
       };
       // Queue 时 ComfyUI 调 serializeValue → 实时构建前端权威完整数据发给后端
       // （前端正在编辑的时间线永远是对的；DB 只做持久化，不参与执行）
@@ -354,10 +388,93 @@ app.registerExtension({
       });
       node._stStopState = stopState;
 
-      // ★ 进入恢复期：setNodeId/setTaskId 等 state 变化不触发 sync 覆盖 widget.value
-      tw._stRestoring = true;
+      // ---------- 恢复时间线（双载体 + 宽容失败） ----------
+      // 载体 A：timeline_data widget = {"taskId":"N"}（工作流 json 的时间线指针）
+      // 载体 B：node.properties.studio_task_id（同值冗余，widget 缺失/时序错位时兜底）
+      // 兼容：旧版完整 payload（version/canvas/clips）→ 直接恢复片段 UI
+      const readBinding = (): { taskId: string; legacy: StudioPayload | null } => {
+        const raw = typeof tw.value === "string" ? tw.value : "";
+        if (raw) {
+          try {
+            const p = JSON.parse(raw) as { taskId?: unknown; version?: number; clips?: unknown[] };
+            if (p && typeof p === "object") {
+              if (p.taskId) return { taskId: String(p.taskId), legacy: null };
+              if (typeof p.version === "number" && Array.isArray(p.clips) && p.clips.length > 0) {
+                return { taskId: "", legacy: p as unknown as StudioPayload };
+              }
+            }
+          } catch {
+            // 非法 JSON：继续走 properties 兜底
+          }
+        }
+        const prop = node.properties?.studio_task_id;
+        return { taskId: typeof prop === "string" && prop ? prop : "", legacy: null };
+      };
 
-      // 任务初始化：widget 已有 taskId（工作流恢复）→ 用之；
+      let restoreTimer: number | undefined;
+      let restoringFor: string | null = null;
+      let restoreAttempt = 0;
+      /** 拉取任务时间线；瞬时失败只重试，绝不清空（清空 = 丢正在编辑的草稿） */
+      const scheduleRestore = (taskId: string) => {
+        restoringFor = taskId;
+        restoreAttempt = 0;
+        const run = async () => {
+          const ok = await store.loadTask(taskId);
+          if (ok) {
+            restoringFor = null;
+            return;
+          }
+          if (store.taskMissing) {
+            // 任务在本地任务库确实不存在（跨机工作流 / 库被清）→ 回未加载态。
+            // 这是**显式**卸载（bindingReleased），允许清空载体。
+            restoringFor = null;
+            console.warn(`[StudioConsole] 任务 ${taskId} 不在本地任务库，回到未加载态`);
+            store.unloadTask();
+            return;
+          }
+          if (restoreAttempt < 3) {
+            restoreAttempt++;
+            const delay = restoreAttempt === 1 ? 400 : 1200;
+            console.warn(
+              `[StudioConsole] 任务 ${taskId} 加载失败（网络/服务异常），${delay}ms 后重试 ${restoreAttempt}/3`,
+            );
+            restoreTimer = window.setTimeout(() => void run(), delay);
+          } else {
+            restoringFor = null;
+            console.error(
+              `[StudioConsole] 任务 ${taskId} 加载失败（已重试 3 次）：已保留本地内容，可稍后手动重选任务`,
+            );
+          }
+        };
+        void run();
+      };
+      node._stStopRestore = () => {
+        if (restoreTimer) window.clearTimeout(restoreTimer);
+        restoreTimer = undefined;
+      };
+
+      /** 从载体恢复绑定；幂等（已就绪 / 正在恢复则跳过）。返回是否读到可用绑定 */
+      const tryRestore = (): boolean => {
+        const b = readBinding();
+        if (b.taskId) {
+          if (store.loadedTaskId === b.taskId || restoringFor === b.taskId) return true;
+          store.setTaskId(b.taskId);
+          scheduleRestore(b.taskId);
+          return true;
+        }
+        if (b.legacy) {
+          console.warn(
+            "[StudioConsole] timeline_data 为旧格式（完整 payload），已恢复片段 UI；",
+            "建议新建/加载任务后重新保存工作流，升级为任务库格式（widget 只存 taskId）",
+          );
+          store.loadFromPayload(b.legacy);
+          return true;
+        }
+        return false;
+      };
+      node._stRestore = tryRestore;
+
+      // 任务初始化：widget/properties 已有 taskId（工作流恢复）→ 用之；
       // 无 → 不创建（待加载界面，需用户先新建/加载任务才能编辑保存）
       store.setNodeId(String(node.id));
       // node.id 在创建早期可能是临时值 -1（真实 id 由 ComfyUI 后续分配）：
@@ -373,40 +490,14 @@ app.registerExtension({
       // 前端构建版本自检（浏览器缓存旧 JS 时给出强刷提示）
       void checkFrontendVersion();
 
-      // 恢复时间线：读取 widget.value，兼容两种格式——
-      // 1) 任务库 {taskId}（当前）：按 id 从 DB 加载（时间线唯一数据源在 SQLite）
-      // 2) 旧版完整 payload（version/canvas/clips，旧构建缓存/旧工作流）：恢复片段 UI 不丢数据
-      const raw = typeof tw.value === "string" ? tw.value : "";
-      let parsed: { taskId?: string; version?: number; clips?: unknown[] } | null = null;
-      if (raw) {
-        try {
-          parsed = JSON.parse(raw) as { taskId?: string; version?: number; clips?: unknown[] };
-        } catch {
-          parsed = null;
-        }
+      // ★ 进入恢复期：setNodeId/setTaskId 等 state 变化不触发 sync 覆盖 widget.value
+      tw._stRestoring = true;
+      if (!tryRestore()) {
+        // 时序兜底：部分前端版本下 configure() 回填 widget 值晚于 nodeCreated
+        // （nodeCreated 由 invokeExtensionsAsync 异步触发）。延迟再读一次载体；
+        // 权威入口仍是 loadedGraphNode（configure 之后统一触发）。
+        restoreTimer = window.setTimeout(() => void tryRestore(), 400);
       }
-      if (parsed?.taskId) {
-        // 工作流记录了任务 id：先暂存（widget sync 需要 taskId 已就位）再加载；
-        // 若该任务在本地 DB 不存在（跨机工作流 / 库被清），回退到未加载态——
-        // 否则残留假 taskId 会让「＋ 片段」误以为有任务，无法新建/保存时间线。
-        store.setTaskId(parsed.taskId);
-        void store.loadTask(parsed.taskId).then((ok) => {
-          if (!ok) store.unloadTask();
-        });
-      } else if (
-        parsed &&
-        typeof parsed.version === "number" &&
-        Array.isArray(parsed.clips) &&
-        parsed.clips.length > 0
-      ) {
-        console.warn(
-          "[StudioConsole] timeline_data 为旧格式（完整 payload），已恢复片段 UI；",
-          "建议新建/加载任务后重新保存工作流，升级为任务库格式（widget 只存 taskId）",
-        );
-        store.loadFromPayload(parsed as unknown as StudioPayload);
-      }
-
-      // ★ 恢复完成：放开 sync 并同步一次（taskId 已设置则写 {taskId}）
       tw._stRestoring = false;
       sync();
     }
@@ -440,30 +531,8 @@ app.registerExtension({
 
     // 恢复时间线 UI（任务库模式）：widget.value 存 {taskId}，按 id 从 DB 加载。
     // 时间线唯一数据源在 SQLite——绝不把时间线写进工作流 json。
-    // 兼容旧格式：widget.value 若是完整 payload（旧构建缓存/旧工作流），恢复片段 UI 不丢数据。
-    const tw = node.widgets?.find((x) => x.name === "timeline_data");
-    const raw = typeof tw?.value === "string" ? tw.value : "";
-    if (raw && node.studioConsole) {
-      try {
-        const parsed = JSON.parse(raw) as { taskId?: string; version?: number; clips?: unknown[] };
-        if (parsed.taskId) {
-          const store = useTimelineStore(piniaInstance!);
-          // 任务 id 在本地库不存在时回退未加载态（同上：避免假 taskId 卡住新建/保存）
-          store.setTaskId(parsed.taskId);
-          void store.loadTask(parsed.taskId).then((ok) => {
-            if (!ok) store.unloadTask();
-          });
-        } else if (
-          typeof parsed.version === "number" &&
-          Array.isArray(parsed.clips) &&
-          parsed.clips.length > 0
-        ) {
-          const store = useTimelineStore(piniaInstance!);
-          store.loadFromPayload(parsed as unknown as StudioPayload);
-        }
-      } catch {
-        // 非法数据：保持空时间线（任务库模式不兼容旧完整数据格式）
-      }
-    }
+    // 统一走 nodeCreated 注册的 tryRestore（双载体 + 幂等 + 失败重试 + 绝不清空）：
+    // 这里在 configure() 回填 widget 值之后触发，是时序上最权威的恢复入口。
+    node._stRestore?.();
   },
 });

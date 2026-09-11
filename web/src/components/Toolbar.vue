@@ -1,4 +1,4 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 import { computed, h, ref } from "vue";
 import { useMessage } from "naive-ui";
 import { storeToRefs } from "pinia";
@@ -8,7 +8,14 @@ import { palette } from "@/styles/theme";
 
 const store = useTimelineStore();
 const message = useMessage();
-const { clips, totalDurationSec, canvas, taskId } = storeToRefs(store);
+const { clips, totalDurationSec, canvas, taskId, loadFailed, saveFailed } = storeToRefs(store);
+
+/** 数据同步异常提示（加载失败=保留了本地内容；落库失败=改动还在内存，未写入 DB） */
+const syncWarning = computed(() => {
+  if (loadFailed.value) return "任务加载失败，已保留本地内容（可稍后重选任务）";
+  if (saveFailed.value) return "时间线尚未写入数据库（改动仍在本地），请检查后端连接";
+  return "";
+});
 
 function formatTotal(sec: number): string {
   const m = Math.floor(sec / 60);
@@ -241,6 +248,9 @@ function patchCanvas(p: Record<string, number>) {
     </div>
 
     <div class="toolbar-right">
+      <!-- 数据同步异常提示（不阻断编辑：内容始终保留在本地/会话快照里） -->
+      <span v-if="syncWarning" class="tb-warn" :title="syncWarning">⚠ 数据同步异常</span>
+
       <!-- 任务库：加载/新建/删除（时间线唯一数据源在 SQLite） -->
       <n-dropdown
         trigger="click"
@@ -363,6 +373,19 @@ function patchCanvas(p: Record<string, number>) {
   color: var(--dc-text-dim);
   white-space: nowrap;
   font-variant-numeric: tabular-nums;
+}
+
+/* 数据同步异常提示（加载/落库失败；悬停看原因） */
+.tb-warn {
+  font-size: 12px;
+  line-height: 1;
+  padding: 5px 8px;
+  border-radius: 6px;
+  color: #fcd34d;
+  background: rgba(251, 191, 36, 0.12);
+  border: 1px solid rgba(251, 191, 36, 0.35);
+  white-space: nowrap;
+  cursor: help;
 }
 
 .tb-btn {
