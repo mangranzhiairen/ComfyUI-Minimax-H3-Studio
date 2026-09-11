@@ -2,11 +2,15 @@
 import { computed, ref } from "vue";
 import { palette } from "@/styles/theme";
 
-// 画布分辨率/帧率选择器：分辨率计算对齐 ComfyUI 官方 ResolutionSelector 节点
-// （comfy_extras/nodes_resolution.py）——以「宽高比 × 目标百万像素」驱动宽高，
-// 而非固定预设列表。与官方节点的差异：倍数固定 32 且用向上取整（官方默认 8、
-// round）——后端采样把宽高向下对齐 32 的倍数（studio/sampling.py _align32），
-// 向上取整可保证结果 ≥ 目标像素、采样时不会被继续收窄。
+// 画布分辨率/帧率选择器：分辨率计算严格对齐官方 ResolutionSelector
+// （comfy_extras/nodes_resolution.py）——以「宽高比 × 目标百万像素」驱动宽高：
+//   totalPixels = megapixels × 1024²
+//   scale       = sqrt(totalPixels / (aspect_w × aspect_h))
+//   width/height = round(ratio × scale / 32) × 32   ← 官方是 round，不是 ceil
+// 唯一差异：对齐倍数固定 32（官方默认 8）——H3 patchify 要求宽高为 32 的倍数。
+// 注：曾把这里改成 ceil（"向上取整保证像素不缩水"），结果每个轴各自向上取整，
+// 既偏离官方表（0.4MP → 864×512 而非 864×480），也把 16:9 拉成 1.6875:1；
+// 后端 sampling._align32 只对非 32 倍数向下取整，本函数输出必为 32 倍数，无需额外保险。
 
 const props = defineProps<{ width: number; height: number; fps: number }>();
 const emit = defineEmits<{
@@ -29,18 +33,19 @@ const RATIOS = [
 ];
 const ratioOptions = RATIOS.map((r) => ({ label: r.label, value: r.key }));
 
-/** 对齐倍数：后端 H3 patchify 要求宽高为 32 的倍数，向上取整保证像素目标不缩水 */
+/** 对齐倍数：后端 H3 patchify 要求宽高为 32 的倍数（官方 ResolutionSelector 默认 8） */
 const ALIGN = 32;
 
-/** 官方 ResolutionSelector.execute 同款算法（round → 改为 ceil + 固定 32 对齐）：
- *  总像素 = megapixels × 1024² → 按宽高比展开 → 对齐到 32 的倍数 */
+/** 官方 ResolutionSelector.execute 同款算法（对齐倍数固定 32）：
+ *  总像素 = megapixels × 1024² → 按宽高比展开 → 各轴四舍五入到 32 的倍数。
+ *  与官方 16:9 表逐行一致（0.2→608×352 … 0.98→1344×768 … 2.0→1920×1088）。 */
 function calcSize(key: string, megapixels: number): { width: number; height: number } {
   const r = RATIOS.find((x) => x.key === key) ?? RATIOS[6];
   const totalPixels = megapixels * 1024 * 1024;
   const scale = Math.sqrt(totalPixels / (r.w * r.h));
   return {
-    width: Math.ceil((r.w * scale) / ALIGN) * ALIGN,
-    height: Math.ceil((r.h * scale) / ALIGN) * ALIGN,
+    width: Math.round((r.w * scale) / ALIGN) * ALIGN,
+    height: Math.round((r.h * scale) / ALIGN) * ALIGN,
   };
 }
 
@@ -69,9 +74,10 @@ const show = ref(false);
 function onOpen(visible: boolean) {
   if (!visible) return;
   ratioKey.value = nearestRatioKey(props.width, props.height);
-  // 反推当前像素总量作为百万像素初值（保留 1 位小数，夹在 H3 实际支持范围 0.1~2 内）
+  // 反推当前像素总量作为百万像素初值（2 位小数：官方 0.98MP→1344×768 这类非 0.1 步进值
+  // 也能原样回填，避免开弹框再应用就漂到 1.0MP→1376×768）
   const px = (props.width * props.height) / (1024 * 1024);
-  mp.value = Math.min(2, Math.max(0.1, Math.round(px * 10) / 10));
+  mp.value = Math.min(2, Math.max(0.1, Math.round(px * 100) / 100));
   draftFps.value = props.fps;
   recalcFromRatio(); // 弹框内宽高始终 = 比例×像素的自洽计算值（32 对齐）
 }
@@ -156,7 +162,7 @@ function onApply() {
         <span class="res-unit">MP</span>
       </div>
 
-      <div class="res-hint">自动 {{ autoSize }}（向上取整到 32 的倍数），下方可微调</div>
+      <div class="res-hint">自动 {{ autoSize }}（官方算法，四舍五入到 32 的倍数），下方可微调</div>
 
       <!-- 宽高（比例/像素自动回填，可手动微调精确值） -->
       <div class="res-pop-row">

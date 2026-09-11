@@ -109,7 +109,7 @@ Queue ── serializeValue 实时构建 {taskId, payload} ──→ timeline_da
 | HistoryRestoreModal.vue | 从历史手动挑选片段恢复到时间线（跨任务库流程） |
 | PromptDiffModal.vue | 提示词版本 diff 弹窗（基于 utils/promptDiff.ts） |
 | PreviewThumb.vue | 预览缩略图：取 WebP **首帧**静态显示（usePreviewThumb）；动画播放由采样 live 播放器（usePreviewPlayer）另担 |
-| ResolutionParam.vue | 画布分辨率/帧率选择：宽高比（官方 ResolutionSelector 同款 8 种）**× 目标百万像素（0.1~2 MP）** 驱动宽高，32 倍数向上取整；按钮显示 WxH@fps |
+| ResolutionParam.vue | 画布分辨率/帧率选择：宽高比（官方 ResolutionSelector 同款 8 种）**× 目标百万像素（0.1~2 MP）** 驱动宽高，官方算法 `round` 到 32 的倍数（与官方 16:9 表逐行一致：0.4MP→864×480、0.98MP→1344×768、2.0MP→1920×1088）；按钮显示 WxH@fps |
 | promptSnippets.ts | `/` 符号表（纯 TS：镜头/说话者/对话/字段/任务类型/关系标记/相机运动/引用标签 8 组 + 智能编号） |
 
 ## 6. 提示词编辑器（PromptEditor.vue）
