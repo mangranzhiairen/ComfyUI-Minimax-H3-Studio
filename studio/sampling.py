@@ -46,6 +46,44 @@ def _align32(value: int) -> int:
     return max(32, (int(value) // 32) * 32)
 
 
+def _call_official(node_class, **kwargs):
+    """按**关键字**调用官方 conditioning 节点的 execute。
+
+    官方 MiniMaxH3 节点的 execute 签名跨 ComfyUI 版本变过（同一份插件要同时跑新旧版）：
+
+    - 旧版 ReferenceToVideo: ``(clip, vae, audio_vae, prompt, width, height, length, ref_image_size=…)``
+    - 新版 ReferenceToVideo: ``(clip, prompt, width, height, length, ref_image_size="match", vae=None, audio_vae=None, …)``
+      （vae/audio_vae 改成 optional 输入后，位置上移到了 ref_image_size 之后）
+
+    位置传参在版本不匹配时会**静默错位**：vae 落到 prompt、width 收到 VAE 对象、
+    height 收到 prompt 字符串，最终在 core 里炸出难以定位的
+    ``unsupported operand type(s) for //: 'str' and 'int'``。
+    所以这里一律按名字传参，并在名字对不上时给出可读报错（而不是又猜一次位置）。
+    """
+    import inspect
+
+    try:
+        params = inspect.signature(node_class.execute).parameters
+    except (TypeError, ValueError):  # 拿不到签名（非 Python 可调用）→ 直接按关键字调用
+        params = None
+    if params is not None and not any(
+        p.kind is p.VAR_KEYWORD for p in params.values()
+    ):
+        accepted = {
+            name
+            for name, p in params.items()
+            if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)
+        }
+        unsupported = sorted(set(kwargs) - accepted)
+        if unsupported:
+            raise RuntimeError(
+                f"{node_class.__name__}.execute 不接受参数 {', '.join(unsupported)}"
+                f"（当前 ComfyUI 的签名: {', '.join(params)}）——"
+                "官方 MiniMaxH3 节点签名已变更，请升级/适配本插件"
+            )
+    return node_class.execute(**kwargs)
+
+
 def run_minimax_conditioning(ctx, cr):
     """按 ConditioningResult 调用官方 conditioning 节点，返回 (positive, latent)。
 
@@ -63,15 +101,16 @@ def run_minimax_conditioning(ctx, cr):
         ref_images = {k: load_image(p) for k, p in cr.ref_images.items()} or None
         ref_videos = {k: load_video(p) for k, p in cr.ref_videos.items()} or None
         ref_audios = {k: load_audio(p) for k, p in cr.ref_audios.items()} or None
-        out = ReferenceToVideo.execute(
-            ctx.clip,
-            ctx.video_vae,
-            ctx.audio_vae,
-            cr.prompt,
-            width,
-            height,
-            cr.length,
-            cr.ref_image_size,
+        out = _call_official(
+            ReferenceToVideo,
+            clip=ctx.clip,
+            vae=ctx.video_vae,
+            audio_vae=ctx.audio_vae,
+            prompt=cr.prompt,
+            width=width,
+            height=height,
+            length=cr.length,
+            ref_image_size=cr.ref_image_size,
             ref_images=ref_images,
             ref_videos=ref_videos,
             ref_audios=ref_audios,
@@ -79,13 +118,14 @@ def run_minimax_conditioning(ctx, cr):
     else:
         first_frame = load_image(cr.first_frame) if cr.first_frame else None
         last_frame = load_image(cr.last_frame) if cr.last_frame else None
-        out = ImageToVideo.execute(
-            ctx.clip,
-            ctx.video_vae,
-            cr.prompt,
-            width,
-            height,
-            cr.length,
+        out = _call_official(
+            ImageToVideo,
+            clip=ctx.clip,
+            vae=ctx.video_vae,
+            prompt=cr.prompt,
+            width=width,
+            height=height,
+            length=cr.length,
             first_frame=first_frame,
             last_frame=last_frame,
         )

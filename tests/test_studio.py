@@ -1,4 +1,4 @@
-﻿"""纯函数层验证：契约解析/校验、Task 注入与条件构建、Motion Context 网格、缓存工具。
+"""纯函数层验证：契约解析/校验、Task 注入与条件构建、Motion Context 网格、缓存工具。
 
 运行（无需 ComfyUI 环境）：
     python tests/test_studio.py
@@ -340,6 +340,142 @@ class SegmentCacheUtilTest(unittest.TestCase):
 
         self.assertEqual(EXPORT_TYPE, "minimax-h3-studio-task")
         self.assertEqual(EXPORT_FORMAT_VERSION, 1)
+
+
+class OfficialNodeCallTest(unittest.TestCase):
+    """官方 conditioning 节点调用：跨 ComfyUI 版本签名漂移的回归测试。
+
+    官方 execute 签名跨版本变过（vae/audio_vae 从位置参数变成 optional 关键字，
+    位置挪到了 ref_image_size 之后）。位置传参在版本不匹配时会静默错位：
+    width 收到 VAE 对象、height 收到 prompt 字符串 → core 里炸出
+    "unsupported operand type(s) for //: 'str' and 'int'"。
+    """
+
+    def setUp(self):
+        import types
+
+        if "folder_paths" not in sys.modules:  # 纯函数测试环境没有 ComfyUI 根目录
+            stub = types.ModuleType("folder_paths")
+            stub.get_input_directory = lambda: str(Path.cwd())
+            sys.modules["folder_paths"] = stub
+
+        import studio.media_loader as media_loader
+        import studio.sampling as sampling
+
+        self.sampling = sampling
+        self.media_loader = media_loader
+        self._orig_load_nodes = sampling._load_minimax_nodes
+        self._orig_images = (media_loader.load_image, media_loader.load_video, media_loader.load_audio)
+        self.clip = object()
+        self.video_vae = object()
+        self.audio_vae = object()
+        # 素材加载：不碰磁盘/ComfyUI，返回哨兵对象
+        media_loader.load_image = lambda p: ("image", p)
+        media_loader.load_video = lambda p: ("video", p)
+        media_loader.load_audio = lambda p: ("audio", p)
+
+    def tearDown(self):
+        self.sampling._load_minimax_nodes = self._orig_load_nodes
+        (
+            self.media_loader.load_image,
+            self.media_loader.load_video,
+            self.media_loader.load_audio,
+        ) = self._orig_images
+
+    def _ctx_and_cr(self, **cr_overrides):
+        from studio.tasks import ConditioningResult, TaskContext
+        from studio.tasks import SamplingConfig
+
+        ctx = TaskContext(
+            canvas=CanvasConfig(fps=24, width=864, height=480),
+            sampling=SamplingConfig(),
+            model=object(),
+            video_vae=self.video_vae,
+            audio_vae=self.audio_vae,
+            clip=self.clip,
+        )
+        cr = ConditioningResult(
+            node="MiniMaxH3ReferenceToVideo",
+            prompt="参考图上的角色走过街道",
+            width=864,
+            height=480,
+            length=124,
+            ref_images={"ref_image_1": "a.png"},
+        )
+        for key, value in cr_overrides.items():
+            object.__setattr__(cr, key, value)
+        return ctx, cr
+
+    def _run_with_signature(self, build_execute):
+        """用 builder 产出的 execute 签名跑一遍 run_minimax_conditioning，返回它收到的参数。"""
+        received: dict = {}
+        execute_fn = build_execute(received)
+
+        FakeRefToVideo = type("FakeRefToVideo", (), {"execute": classmethod(execute_fn)})
+        self.sampling._load_minimax_nodes = lambda: (None, FakeRefToVideo, None)
+
+        ctx, cr = self._ctx_and_cr()
+        self.sampling.run_minimax_conditioning(ctx, cr)
+        return received
+
+    def test_new_core_signature_keyword_call(self):
+        """新版签名（vae/audio_vae 在 ref_image_size 之后作为 optional）：值必须落到位。"""
+
+        def build(received):
+            def execute(cls, clip, prompt, width, height, length, ref_image_size="match",
+                        vae=None, audio_vae=None, ref_images=None, ref_videos=None,
+                        ref_video_audios=None, ref_audios=None):
+                # 记录**按参数名**收到的值：位置传参错位时这里立刻暴露
+                received.update(locals())
+                received.pop("cls", None)
+                return ("positive", "latent")
+
+            return execute
+
+        got = self._run_with_signature(build)
+        self.assertIs(got["vae"], self.video_vae)
+        self.assertIs(got["audio_vae"], self.audio_vae)
+        self.assertIs(got["clip"], self.clip)
+        self.assertIsInstance(got["prompt"], str)   # 不能是 VAE 对象
+        self.assertIsInstance(got["width"], int)    # 不能是 VAE 对象
+        self.assertIsInstance(got["height"], int)   # 不能是 prompt 字符串
+        self.assertEqual((got["width"], got["height"]), (864, 480))
+        self.assertEqual(got["length"], 124)
+        self.assertEqual(got["ref_image_size"], "match")
+        self.assertEqual(got["ref_images"], {"ref_image_1": ("image", "a.png")})
+
+    def test_old_core_signature_keyword_call(self):
+        """旧版签名（vae/audio_vae 在前）：同一份调用同样必须正确。"""
+
+        def build(received):
+            def execute(cls, clip, vae, audio_vae, prompt, width, height, length,
+                        ref_image_size="match", ref_images=None, ref_videos=None,
+                        ref_video_audios=None, ref_audios=None):
+                received.update(locals())
+                received.pop("cls", None)
+                return ("positive", "latent")
+
+            return execute
+
+        got = self._run_with_signature(build)
+        self.assertIs(got["vae"], self.video_vae)
+        self.assertIs(got["audio_vae"], self.audio_vae)
+        self.assertIsInstance(got["prompt"], str)
+        self.assertIsInstance(got["height"], int)
+        self.assertEqual(got["ref_image_size"], "match")
+
+    def test_unknown_parameter_fails_loudly(self):
+        """签名对不上时报可读错误，而不是静默错位。"""
+
+        def execute(cls, clip, prompt, width, height, length):  # 缺 vae/audio_vae 等
+            return None
+
+        self.sampling._load_minimax_nodes = lambda: (None, type(
+            "FakeRefToVideo", (), {"execute": classmethod(execute)}), None)
+        ctx, cr = self._ctx_and_cr()
+        with self.assertRaises(RuntimeError) as cm:
+            self.sampling.run_minimax_conditioning(ctx, cr)
+        self.assertIn("FakeRefToVideo.execute 不接受参数", str(cm.exception))
 
 
 if __name__ == "__main__":

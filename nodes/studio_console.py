@@ -165,7 +165,8 @@ class MiniMaxH3StudioConsole:
             audio = _placeholder_audio()
             fps, frame_count = 24.0, 0
         except Exception as exc:  # noqa: BLE001 节点层兜底，错误回显到 report
-            log.error("创意工作台执行失败: %s: %s", type(exc).__name__, exc)  # 后端控制台可见
+            # 同时打印完整堆栈：report 只回显一行摘要，堆栈才能定位到具体出错的 core 代码
+            log.error("创意工作台执行失败: %s: %s", type(exc).__name__, exc, exc_info=True)
             report = f"执行失败: {type(exc).__name__}: {exc}"
             images = _placeholder_image(480, 864)
             audio = _placeholder_audio()
