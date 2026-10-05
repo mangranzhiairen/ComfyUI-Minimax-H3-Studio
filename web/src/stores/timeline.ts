@@ -6,10 +6,17 @@ import {
   type Clip,
   type ClipHistory,
   type ClipPayload,
+  type ClipPipelinePayload,
+  type PipelineLibraryEntry,
   type PromptSnapshot,
   type VersionSample,
   DURATION_LIMITS,
 } from "@/types/timeline";
+import { cloneClipPipeline, flattenClipPipeline, newClipPipeline, openClipPipeline } from "@/utils/subgraph";
+
+/** 采样流程导出文件标记（导入时校验；与任务导出 `.studio-task.json` 同风格） */
+const PIPELINE_EXPORT_TYPE = "minimax-h3-studio-pipeline";
+const PIPELINE_EXPORT_VERSION = 1;
 
 /** 生成片段 id（避免与随机碰撞） */
 function createId(): string {
@@ -23,10 +30,13 @@ function createId(): string {
  *  - 键是 taskId 本身：恢复时已经确定要打开哪个任务，不存在张冠李戴。
  *  - 页面刷新/关闭即失效（那时以 DB 为准）。 */
 const SESSION_SNAPSHOT_LIMIT = 20;
-const sessionTimelines = new Map<string, StudioPayload>();
+/** 会话内时间线快照：payload + 采样流程库（库不进 StudioPayload，但兜底恢复时要一起留着） */
+type TimelineSnapshot = StudioPayload & { pipelines?: PipelineLibraryEntry[] };
+
+const sessionTimelines = new Map<string, TimelineSnapshot>();
 
 /** 记录某任务的时间线快照（落库前调用，覆盖式） */
-function rememberSessionTimeline(taskId: string, payload: StudioPayload): void {
+function rememberSessionTimeline(taskId: string, payload: TimelineSnapshot): void {
   sessionTimelines.delete(taskId); // 重插 → Map 迭代顺序按最近使用排列
   sessionTimelines.set(taskId, payload);
   while (sessionTimelines.size > SESSION_SNAPSHOT_LIMIT) {
@@ -36,7 +46,7 @@ function rememberSessionTimeline(taskId: string, payload: StudioPayload): void {
   }
 }
 
-function sessionTimelineOf(taskId: string): StudioPayload | null {
+function sessionTimelineOf(taskId: string): TimelineSnapshot | null {
   return sessionTimelines.get(taskId) ?? null;
 }
 
@@ -51,6 +61,8 @@ function fetchApi(url: string, init?: RequestInit): Promise<Response> {
 export const useTimelineStore = defineStore("timeline", {
   state: () => ({
     clips: [] as Clip[],
+    /** 任务级采样流程库（一份定义可被多张卡片按 pipelineId 引用；随任务时间线存 DB） */
+    pipelines: [] as PipelineLibraryEntry[],
     canvas: {
       fps: 24,
       width: 864,
@@ -100,6 +112,24 @@ export const useTimelineStore = defineStore("timeline", {
     totalDurationSec(state): number {
       return state.clips.reduce((acc, seg) => acc + seg.durationSec, 0);
     },
+
+    /** 按 id 取流程库条目（未绑定/已被删除返回 null → 该片段走内置官方流程） */
+    pipelineById(state): (id: string | null | undefined) => PipelineLibraryEntry | null {
+      return (id) => (id ? state.pipelines.find((p) => p.id === id) ?? null : null);
+    },
+
+    /** 片段当前生效的采样流程（null = 内置官方流程） */
+    pipelineOf(state) {
+      return (clip: Clip | null | undefined): PipelineLibraryEntry | null => {
+        const id = clip?.pipelineId;
+        return id ? state.pipelines.find((p) => p.id === id) ?? null : null;
+      };
+    },
+
+    /** 某流程被多少张卡片引用（删除确认 / 共享提示用） */
+    pipelineUsage(state): (id: string) => number {
+      return (id) => state.clips.filter((c) => c.pipelineId === id).length;
+    },
     selectedClip(state): Clip | null {
       return state.clips.find((s) => s.id === state.selectedId) ?? null;
     },
@@ -138,6 +168,8 @@ export const useTimelineStore = defineStore("timeline", {
         ...src,
         id: createId(),
         prompt: src.prompt,
+        // 采样流程是**引用**：副本沿用同一份流程（流程库的意义就是一份挂多张卡片）；
+        // 要独立改一份，用流程库的「复制为新流程」。
       };
       this.clips.splice(idx + 1, 0, copy);
       this.selectedId = copy.id;
@@ -148,6 +180,132 @@ export const useTimelineStore = defineStore("timeline", {
       if (fromIndex === toIndex) return;
       const [seg] = this.clips.splice(fromIndex, 1);
       this.clips.splice(toIndex, 0, seg);
+    },
+
+    // ---------- 采样流程库（任务级；一份定义可被多张卡片引用） ----------
+
+    /** 生成不与现有流程重名的名称（"X" → "X（2）"） */
+    uniquePipelineName(base: string): string {
+      const name = base.trim() || "未命名流程";
+      if (!this.pipelines.some((p) => p.name === name)) return name;
+      for (let i = 2; i < 1000; i += 1) {
+        const candidate = `${name}（${i}）`;
+        if (!this.pipelines.some((p) => p.name === candidate)) return candidate;
+      }
+      return `${name}（${Date.now()}）`;
+    },
+
+    /** 新建流程（默认给一份空白骨架槽：6 进 / 1 出） */
+    createPipeline(label = ""): PipelineLibraryEntry {
+      const entry = newClipPipeline(this.uniquePipelineName(label || `流程 ${this.pipelines.length + 1}`));
+      this.pipelines.push(entry);
+      void this.saveToDb();
+      return entry;
+    },
+
+    /** 打开某流程的原生子图编辑器（工具栏库管理入口：不依赖卡片；编辑内容回写库） */
+    openPipelineEditor(id: string): { ok: boolean; message: string } {
+      const entry = this.pipelines.find((p) => p.id === id);
+      if (!entry) return { ok: false, message: "流程不存在（可能已被删除）" };
+      return openClipPipeline(entry, (def) => {
+        // 回写前确认流程还在库里（删除后的迟到回写必须丢弃）
+        if (this.pipelines.some((p) => p.id === entry.id)) this.updatePipelineDef(entry.id, def);
+      });
+    },
+
+    /** 导出单份流程为可移植 JSON（前端直接下载；不含任何本机路径/缓存） */
+    exportPipeline(id: string): boolean {
+      const entry = this.pipelines.find((p) => p.id === id);
+      if (!entry) return false;
+      const payload = {
+        type: PIPELINE_EXPORT_TYPE,
+        version: PIPELINE_EXPORT_VERSION,
+        name: entry.name,
+        def: entry.def,
+      };
+      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${entry.name.replace(/[\\/:*?"<>|]/g, "_")}.studio-pipeline.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+      return true;
+    },
+
+    /** 导入流程文件（别人分享的流程）：校验标记 → 以**新 id** 收进流程库 */
+    async importPipelineFile(file: File): Promise<{ ok: boolean; message: string }> {
+      let data: unknown;
+      try {
+        data = JSON.parse(await file.text());
+      } catch {
+        return { ok: false, message: "不是合法的 JSON 文件" };
+      }
+      const obj = data as { type?: string; version?: number; name?: string; def?: unknown };
+      if (obj?.type !== PIPELINE_EXPORT_TYPE) {
+        return { ok: false, message: "不是采样流程文件（缺少 type 标记）" };
+      }
+      if (obj.version !== PIPELINE_EXPORT_VERSION) {
+        return { ok: false, message: `不支持的流程文件版本：${String(obj.version)}` };
+      }
+      if (!obj.def || typeof obj.def !== "object") {
+        return { ok: false, message: "流程文件缺少 def 定义" };
+      }
+      const name = this.uniquePipelineName(String(obj.name || "导入的流程"));
+      // 新 id（copy 内会 JSON 深拷贝并改写 def 里的 id/name），避免与现有流程撞 id / 子图冲突
+      const entry = cloneClipPipeline({ id: "", name, def: obj.def }, name);
+      this.pipelines.push(entry);
+      void this.saveToDb();
+      return { ok: true, message: `已导入流程：${entry.name}` };
+    },
+
+    /** 回写流程定义（子图编辑器轮询回写；引用它的所有片段一起生效） */
+    updatePipelineDef(id: string, def: unknown): void {
+      const entry = this.pipelines.find((p) => p.id === id);
+      if (!entry) return;
+      entry.def = def;
+    },
+
+    renamePipeline(id: string, name: string): void {
+      const entry = this.pipelines.find((p) => p.id === id);
+      const trimmed = name.trim();
+      if (!entry || !trimmed || entry.name === trimmed) return;
+      entry.name = trimmed;
+    },
+
+    /** 复制为新流程（要独立改一份时的出口：新 id + 内容照抄） */
+    duplicatePipeline(id: string): PipelineLibraryEntry | null {
+      const src = this.pipelines.find((p) => p.id === id);
+      if (!src) return null;
+      const copy = cloneClipPipeline(src, `${src.name} 副本`);
+      this.pipelines.push(copy);
+      return copy;
+    },
+
+    /**
+     * 删除流程：引用它的片段全部回到内置官方流程（**定义不可恢复**，调用方需二次确认）。
+     * @returns 受影响的片段数
+     */
+    deletePipeline(id: string): number {
+      const idx = this.pipelines.findIndex((p) => p.id === id);
+      if (idx === -1) return 0;
+      this.pipelines.splice(idx, 1);
+      let affected = 0;
+      for (const seg of this.clips) {
+        if (seg.pipelineId === id) {
+          delete seg.pipelineId;
+          affected += 1;
+        }
+      }
+      return affected;
+    },
+
+    /** 绑定/解绑片段与流程（null = 回到内置官方流程） */
+    setClipPipeline(clipId: string, pipelineId: string | null): void {
+      const seg = this.clips.find((s) => s.id === clipId);
+      if (!seg) return;
+      if (pipelineId) seg.pipelineId = pipelineId;
+      else delete seg.pipelineId;
     },
 
     updateClip(id: string, patch: Partial<Clip>): void {
@@ -196,12 +354,14 @@ export const useTimelineStore = defineStore("timeline", {
       this.zoom = Math.min(256, Math.max(24, zoom));
     },
 
-    /** 序列化为发给后端的数据负载（数据契约出口） */
+    /** 序列化为发给后端的数据负载（数据契约出口）。
+     *  这里把片段的流程引用**解析**成 `{id, name, graph}`（方案 A 摊平图），
+     *  后端执行器直接把 [__studio__, "槽名"] 换成运行时输入即可；未绑定的片段不带 pipeline。 */
     serialize(): StudioPayload {
       return {
         version: 1,
         canvas: { ...this.canvas },
-        clips: this.clips.map(toClipPayload),
+        clips: this.clips.map((c) => toClipPayload(c, this.pipelines)),
         totalDurationSec: this.totalDurationSec,
       };
     },
@@ -228,6 +388,7 @@ export const useTimelineStore = defineStore("timeline", {
     /** 新建空任务（清空当前时间线并创建新任务记录），创建后立即落库 */
     async newTask(nodeId: string, name = ""): Promise<string | null> {
       this.clips = [];
+      this.pipelines = [];
       this.canvas = { fps: 24, width: 864, height: 480 };
       this.selectedId = null;
       this.historyByClipId = {}; // 新任务无历史
@@ -244,6 +405,7 @@ export const useTimelineStore = defineStore("timeline", {
      *  bindingReleased=true 是**唯一**允许清空工作流载体的信号（I1 载体侧）。 */
     unloadTask(): void {
       this.clips = [];
+      this.pipelines = [];
       this.canvas = { fps: 24, width: 864, height: 480 };
       this.selectedId = null;
       this.taskId = null;
@@ -297,6 +459,8 @@ export const useTimelineStore = defineStore("timeline", {
       let seq: {
         canvas?: CanvasConfig;
         clips?: Record<string, unknown>[];
+        /** 任务级采样流程库（引用模型：片段只存 pipelineId） */
+        pipelines?: PipelineLibraryEntry[];
       } = {};
       try {
         seq = JSON.parse(data.timeline || "{}");
@@ -304,7 +468,16 @@ export const useTimelineStore = defineStore("timeline", {
         seq = {};
       }
 
-      const incoming = (seq.clips ?? []).map((c) => fromClipPayload(c as unknown as ClipPayload));
+      const rows = seq.clips ?? [];
+      const incoming = rows.map((c) => fromClipPayload(c as unknown as ClipPayload));
+      // 流程库：新版直接读 `pipelines`；旧数据把定义内联在 clips[].pipeline.def 里
+      //   → 收编进库（引用 model 之前的数据无需手工迁移）。
+      const library: PipelineLibraryEntry[] = Array.isArray(seq.pipelines)
+        ? seq.pipelines.filter((p) => p && typeof p.id === "string")
+        : [];
+      for (const legacy of legacyPipelinesFromRows(rows)) {
+        if (!library.some((p) => p.id === legacy.id)) library.push(legacy);
+      }
       // 兜底来源优先级：本地已就绪的同任务内容 > 本会话快照
       const localReady = this.loadedTaskId === taskId && this.clips.length > 0;
       const cached = sessionTimelineOf(taskId);
@@ -313,6 +486,10 @@ export const useTimelineStore = defineStore("timeline", {
         if (seq.canvas) this.canvas = { ...seq.canvas };
         else if (!localReady && cached) this.canvas = { ...cached.canvas };
         this.clips = fallback;
+        // 流程库：本地已就绪优先保留本地；否则用会话快照里的库（都没有就只能是空的）
+        if (!localReady && cached?.pipelines?.length) {
+          this.pipelines = cached.pipelines.map((p) => ({ id: p.id, name: p.name, def: p.def }));
+        }
         this.selectedId = this.clips[0]?.id ?? null;
         this.taskId = taskId;
         this.loadedTaskId = taskId;
@@ -328,6 +505,7 @@ export const useTimelineStore = defineStore("timeline", {
       if (seq.canvas) this.canvas = { ...seq.canvas };
       // 直接恢复每 clip 的当前参数草稿（timeline 是权威，不指向历史）
       this.clips = incoming;
+      this.pipelines = library;
       this.selectedId = this.clips[0]?.id ?? null;
       this.taskId = taskId;
       this.loadedTaskId = taskId;
@@ -619,17 +797,22 @@ export const useTimelineStore = defineStore("timeline", {
     async saveToDb(): Promise<boolean> {
       if (!this.taskId) return false;
       if (this.loadedTaskId !== this.taskId) return false; // 恢复未完成：拒绝写库（防空覆盖）
+      // 时间线当前数据 = canvas + clips（含流程引用）+ 采样流程库（定义的唯一真相）；
+      // 摊平图是派生物（发 payload 时才生成），不落库。
       const seq = {
         version: 1,
         canvas: { ...this.canvas },
-        clips: this.clips.map((c) => toClipPayload(c)),
+        clips: this.clips.map((c) => toClipDbRow(c)),
+        pipelines: this.pipelines.map((p) => ({ id: p.id, name: p.name, def: p.def })),
         totalDurationSec: this.totalDurationSec,
       };
-      // 会话内快照：先记后发 —— 写库失败/被清空时仍能兜底恢复（I1 的内存侧）
+      // 会话内快照：先记后发 —— 写库失败/被清空时仍能兜底恢复（I1 的内存侧）；
+      // 流程库也一起记（库不在 StudioPayload 里，兜底恢复缺它就全变默认流程）
       rememberSessionTimeline(this.taskId, {
         version: 1,
         canvas: { ...this.canvas },
-        clips: this.clips.map((c) => toClipPayload(c)),
+        clips: this.clips.map((c) => toClipDbRow(c) as unknown as ClipPayload),
+        pipelines: this.pipelines.map((p) => ({ id: p.id, name: p.name, def: p.def })),
         totalDurationSec: this.totalDurationSec,
       });
       try {
@@ -729,7 +912,8 @@ function toMediaPayload(m: ReferenceMedia): { path: string; kind: ReferenceMedia
   return { path: m.path || m.name, kind: m.kind };
 }
 
-function toClipPayload(s: Clip): ClipPayload {
+/** 片段基础字段（DB 行与后端 payload 共用） */
+function clipBaseFields(s: Clip): Omit<ClipPayload, "pipeline"> {
   const refImages = (s.refImages ?? []).map(toMediaPayload);
   const refVideos = (s.refVideos ?? []).map(toMediaPayload);
   const refAudios = (s.refAudios ?? []).map(toMediaPayload);
@@ -750,6 +934,32 @@ function toClipPayload(s: Clip): ClipPayload {
   };
 }
 
+/**
+ * DB 草稿行：**只存引用**（`pipelineId`），定义在流程库（`pipelines`）里一处；
+ * 摊平图是派生物，绝不落草稿。
+ */
+function toClipDbRow(s: Clip): Record<string, unknown> {
+  return {
+    ...clipBaseFields(s),
+    ...(s.pipelineId ? { pipelineId: s.pipelineId } : {}),
+  };
+}
+
+/**
+ * 发给后端的 payload 行：把引用**解析**成具体流程（`{id, name, graph}`）——
+ * 后端只认摊平图，不认识流程库；引用悬空（流程被删）时按"无流程"发（走内置官方链）。
+ */
+function toClipPayload(s: Clip, pipelines: PipelineLibraryEntry[]): ClipPayload {
+  const entry = s.pipelineId ? pipelines.find((p) => p.id === s.pipelineId) : undefined;
+  const pipeline: ClipPipelinePayload | undefined = entry
+    ? { id: entry.id, name: entry.name, graph: flattenClipPipeline(entry) }
+    : undefined;
+  return {
+    ...clipBaseFields(s),
+    ...(pipeline ? { pipeline } : {}),
+  } as ClipPayload;
+}
+
 /** 反序列化：契约数据 → UI 数据（name 用 path 兜底显示；图片按 path 重建预览 URL） */
 function fromMediaPayload(m: { path: string; kind: ReferenceMedia["kind"] }): ReferenceMedia {
   const media: ReferenceMedia = { name: m.path, kind: m.kind, path: m.path };
@@ -765,7 +975,11 @@ function fromMediaPayload(m: { path: string; kind: ReferenceMedia["kind"] }): Re
   return media;
 }
 
-function fromClipPayload(s: ClipPayload): Clip {
+/**
+ * DB 行 → 片段。流程迁移：旧数据把定义内联在 `pipeline.def` 里（引用模型之前），
+ * 这里把它登记进流程库并改成 `pipelineId` 引用（迁移逻辑在调用方，见 `migrateLegacyPipelines`）。
+ */
+function fromClipPayload(s: ClipPayload & { pipelineId?: string | null }): Clip {
   return {
     id: s.id,
     mode: s.mode,
@@ -776,6 +990,12 @@ function fromClipPayload(s: ClipPayload): Clip {
     enabled: s.enabled ?? true,
     ...(s.continuity ? { continuity: s.continuity } : {}),
     ...(s.sampleFp ? { sampleFp: s.sampleFp } : {}),
+    // 引用形态（新数据）：只保留 id，定义在流程库里
+    ...(s.pipelineId ? { pipelineId: String(s.pipelineId) } : {}),
+    // 旧内联形态：先按 id 记下引用，定义由 migrateLegacyPipelines() 收进流程库
+    ...(!s.pipelineId && s.pipeline?.id
+      ? { pipelineId: String(s.pipeline.id) }
+      : {}),
     ...(s.firstFrame ? { firstFrame: fromMediaPayload(s.firstFrame) } : {}),
     ...(s.lastFrame ? { lastFrame: fromMediaPayload(s.lastFrame) } : {}),
     ...(s.refImages?.length ? { refImages: s.refImages.map(fromMediaPayload) } : {}),
@@ -783,6 +1003,20 @@ function fromClipPayload(s: ClipPayload): Clip {
     ...(s.refAudios?.length ? { refAudios: s.refAudios.map(fromMediaPayload) } : {}),
     ...(s.sourceVideo ? { sourceVideo: fromMediaPayload(s.sourceVideo) } : {}),
   };
+}
+
+/** 从 DB 行里捞出旧的内联流程定义（迁移用；返回去重后的条目） */
+function legacyPipelinesFromRows(rows: Record<string, unknown>[]): PipelineLibraryEntry[] {
+  const out: PipelineLibraryEntry[] = [];
+  const seen = new Set<string>();
+  for (const row of rows) {
+    const inline = (row as { pipeline?: { id?: string; name?: string; def?: unknown } }).pipeline;
+    const id = inline?.id ? String(inline.id) : "";
+    if (!id || seen.has(id) || inline?.def === undefined) continue;
+    seen.add(id);
+    out.push({ id, name: String(inline.name || `流程 ${out.length + 1}`), def: inline.def });
+  }
+  return out;
 }
 
 /** 画面语义快照 → 片段当前内容。执行态/编排（enabled/continuity）与锁定（sampleFp）保持不动

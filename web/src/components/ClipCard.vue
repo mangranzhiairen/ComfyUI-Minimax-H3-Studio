@@ -1,9 +1,10 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useMessage } from "naive-ui";
 import { useTimelineStore } from "@/stores/timeline";
 import { palette } from "@/styles/theme";
 import { usePreviewPlayer } from "@/composables/usePreviewPlayer";
+import { flattenClipPipeline, flushClipPipelineSync } from "@/utils/subgraph";
 import type { Clip, ClipMode } from "@/types/timeline";
 
 const props = defineProps<{
@@ -196,6 +197,8 @@ onBeforeUnmount(() => {
   uninstallDocClose();
   stopPlayer();
   resizeObserver?.disconnect();
+  // 卡片卸载 = 切工作流 tab 销毁节点：把子图最后一次编辑补写进草稿（否则可能丢最后一次改动）
+  flushClipPipelineSync();
 });
 
 /** 缩略图/占位背景：素材图优先，无图用模式对应的渐变占位（采样预览由 canvas 层绘制） */
@@ -223,6 +226,71 @@ const sampleCount = computed(
   () => store.historyByClipId[props.clip.id]?.samples.length ?? 0,
 );
 const showDeleteConfirm = ref(false);
+
+// ---------- 采样流程（任务级流程库 + 片段级引用） ----------
+// 卡片上的 ⊞ 只做**选择**：默认官方流程 / 流程库里的条目（选择即绑定，不打开子图）。
+// 流程本身的新建/编辑/重命名/复制/删除/导入导出都在工具栏「采样流程库」里。
+
+/** 该卡片当前生效的流程（null = 内置官方流程） */
+const activePipeline = computed(() => store.pipelineOf(props.clip));
+
+/** 引用了流程但库条目已不存在（比如流程被删）→ 实际回默认，给个提示态 */
+const pipelineDangling = computed(
+  () => !!props.clip.pipelineId && !activePipeline.value,
+);
+
+const pipelineMenuOptions = computed(() => {
+  const opts: { key: string; label?: string; type?: "divider" }[] = [
+    { key: "default", label: "默认官方采样流程" },
+  ];
+  if (store.pipelines.length) {
+    opts.push({ type: "divider", key: "d1" });
+    for (const p of store.pipelines) {
+      const used = store.pipelineUsage(p.id);
+      opts.push({
+        key: `use:${p.id}`,
+        label: used > 1 ? `${p.name}（${used} 张卡片）` : p.name,
+      });
+    }
+  }
+  return opts;
+});
+
+const pipelineButtonTitle = computed(() => {
+  if (pipelineDangling.value) return "引用的采样流程已不存在（按默认官方流程执行）——点击选择";
+  if (activePipeline.value) return `采样流程：${activePipeline.value.name}（点击切换；流程库在工具栏）`;
+  return "采样流程：默认官方（点击选择；流程库在工具栏）";
+});
+
+function onPickPipeline(key: string) {
+  if (key === "default") {
+    store.setClipPipeline(props.clip.id, null);
+    void store.saveToDb();
+    message.info("已切回默认官方采样流程");
+    return;
+  }
+  if (!key.startsWith("use:")) return;
+  const entry = store.pipelines.find((p) => p.id === key.slice(4));
+  if (!entry) return;
+  store.setClipPipeline(props.clip.id, entry.id);
+  void store.saveToDb();
+  message.success(`已切换采样流程：${entry.name}`);
+}
+
+// ---------- 摊平执行图预览（方案 A：测试用，看前端摊出来的平铺图长什么样） ----------
+const showFlatGraph = ref(false);
+const flatGraphJson = ref("");
+const flatWarnings = ref<string[]>([]);
+
+function onShowFlatGraph(e: MouseEvent) {
+  e.stopPropagation();
+  const entry = activePipeline.value;
+  if (!entry) return;
+  const graph = flattenClipPipeline(entry);
+  flatWarnings.value = graph.warnings;
+  flatGraphJson.value = JSON.stringify(graph, null, 2);
+  showFlatGraph.value = true;
+}
 
 // ---------- 采样/解码处理中（executor 经 WebSocket 广播，卡片绿框 + 进度条） ----------
 // samplingProgress 覆盖采样（phase='sampling'）与 VAE 解码（phase='decoding'）两阶段：
@@ -383,6 +451,27 @@ onMounted(() => {
           />
         </label>
         <button class="clip-btn" title="复制片段" @click="onDuplicate">⧉</button>
+        <!-- 采样流程：下拉选择（默认官方 / 流程库条目），选择即绑定；编辑/新建等在下拉里 -->
+        <n-dropdown
+          trigger="click"
+          placement="bottom-end"
+          :options="pipelineMenuOptions"
+          :show-arrow="true"
+          @select="onPickPipeline"
+        >
+          <button
+            class="clip-btn pipeline"
+            :class="{ bound: !!activePipeline, dangling: pipelineDangling }"
+            :title="pipelineButtonTitle"
+            @click.stop
+          >⊞</button>
+        </n-dropdown>
+        <button
+          v-if="activePipeline"
+          class="clip-btn"
+          title="查看摊平后的执行图（发给后端的形态）"
+          @click="onShowFlatGraph"
+        >{}</button>
         <button class="clip-btn danger" title="删除片段" @click="onRemove">✕</button>
       </div>
 
@@ -489,6 +578,19 @@ onMounted(() => {
     @negative-click="showDeleteConfirm = false"
     @close="showDeleteConfirm = false"
   />
+
+  <!-- 摊平执行图预览（方案 A）：卡片子图 → 平铺节点图（发给后端的形态） -->
+  <n-modal
+    v-model:show="showFlatGraph"
+    preset="card"
+    title="采样流程 · 摊平执行图"
+    class="flat-modal"
+  >
+    <div v-if="flatWarnings.length" class="flat-warn">
+      <div v-for="(w, i) in flatWarnings" :key="i">⚠ {{ w }}</div>
+    </div>
+    <pre class="flat-json">{{ flatGraphJson }}</pre>
+  </n-modal>
 
   <!-- 大预览弹框：hover 2s 后出现在鼠标旁（同一播放器切画布放大）；鼠标移出缓冲带即关闭。
        画布常驻渲染（v-show）——ref 始终可用，开框即切换绘制目标无延迟 -->
@@ -650,6 +752,20 @@ onMounted(() => {
 .clip-btn.danger:hover {
   background: v-bind("palette.danger");
   color: #fff;
+}
+/* 采样流程入口：已绑定的卡片高亮（与「已选用缓存 latent」的绿色区分开） */
+.clip-btn.pipeline:hover {
+  background: v-bind("palette.accent");
+  color: #0f172a;
+}
+.clip-btn.pipeline.bound {
+  color: v-bind("palette.accent");
+  box-shadow: inset 0 0 0 1px v-bind("palette.accentDim");
+}
+/* 引用的流程已被删除（实际按默认流程执行）：警示色提示需要重新选 */
+.clip-btn.pipeline.dangling {
+  color: #fbbf24;
+  box-shadow: inset 0 0 0 1px rgba(251, 191, 36, 0.55);
 }
 
 /* 参与生成勾选框 */
@@ -867,6 +983,32 @@ onMounted(() => {
 }
 .clip-resize:hover {
   background: v-bind("palette.accent") !important;
+}
+
+/* 摊平执行图预览：等宽 JSON + 问题清单（滚动，避免撑爆弹窗） */
+.flat-modal :deep(.n-card__content) {
+  max-height: 70vh;
+  overflow: auto;
+}
+.flat-warn {
+  margin-bottom: 8px;
+  padding: 6px 8px;
+  border-radius: 4px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: #fbbf24;
+  background: rgba(251, 191, 36, 0.1);
+  border: 1px solid rgba(251, 191, 36, 0.35);
+}
+.flat-json {
+  margin: 0;
+  max-height: 60vh;
+  overflow: auto;
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--dc-text);
 }
 
 /* ---------- 大预览弹框（hover 2s 后，跟随鼠标；canvas 位图即帧等比尺寸，无黑边） ---------- */

@@ -107,6 +107,84 @@ async function refreshTasks() {
   }));
 }
 
+// ---------- 采样流程库（工具栏统一管理：新建/编辑/重命名/复制/删除 + 导入导出） ----------
+// 片段上的 ⊞ 下拉只负责**选择**（默认官方 / 库里某一份）；这里管流程本身。
+
+const showPipelineManager = ref(false);
+const pipelineFileInput = ref<HTMLInputElement | null>(null);
+
+/** 重命名：待改的流程 id + 输入值 */
+const renamingPipelineId = ref<string | null>(null);
+const pipelineNameInput = ref("");
+
+/** 删除：待删的流程 id（连带引用它的卡片回默认流程） */
+const deletingPipelineId = ref<string | null>(null);
+const deletingPipeline = computed(() =>
+  deletingPipelineId.value ? store.pipelines.find((p) => p.id === deletingPipelineId.value) ?? null : null,
+);
+
+function onNewPipeline() {
+  const entry = store.createPipeline();
+  showPipelineManager.value = false;
+  const res = store.openPipelineEditor(entry.id);
+  if (res.ok) message.success(`已新建流程：${entry.name}（在子图里搭好采样链后保存）`);
+  else message.error(res.message);
+}
+
+function onEditPipeline(id: string) {
+  showPipelineManager.value = false;
+  const res = store.openPipelineEditor(id);
+  if (res.ok) message.success(res.message);
+  else message.error(res.message);
+}
+
+function startRenamePipeline(id: string) {
+  renamingPipelineId.value = id;
+  pipelineNameInput.value = store.pipelines.find((p) => p.id === id)?.name ?? "";
+}
+
+function confirmRenamePipeline() {
+  const id = renamingPipelineId.value;
+  const name = pipelineNameInput.value.trim();
+  if (id && name) store.renamePipeline(id, store.uniquePipelineName(name));
+  renamingPipelineId.value = null;
+  void store.saveToDb();
+}
+
+function onDuplicatePipeline(id: string) {
+  const copy = store.duplicatePipeline(id);
+  if (copy) message.success(`已复制为新流程：${copy.name}`);
+}
+
+function onExportPipeline(id: string) {
+  if (store.exportPipeline(id)) message.success("流程已导出（可分享给别人导入）");
+  else message.error("导出失败：流程不存在");
+}
+
+function onImportPipelineFile(e: Event) {
+  const input = e.target as HTMLInputElement;
+  const file = input.files?.[0];
+  input.value = ""; // 允许重复导入同一个文件
+  if (!file) return;
+  void store.importPipelineFile(file).then((res) => {
+    if (res.ok) message.success(res.message);
+    else message.error(res.message);
+  });
+}
+
+function confirmDeletePipeline() {
+  const entry = deletingPipeline.value;
+  deletingPipelineId.value = null;
+  if (!entry) return;
+  const affected = store.deletePipeline(entry.id);
+  void store.saveToDb();
+  message.warning(
+    affected > 0
+      ? `已删除流程「${entry.name}」，${affected} 张卡片回到默认官方流程`
+      : `已删除流程「${entry.name}」`,
+  );
+}
+
 // ---------- 新建 / 重命名 / 复制（弹名称输入，强制非空） ----------
 
 const showNameModal = ref(false);
@@ -274,6 +352,66 @@ function patchCanvas(p: Record<string, number>) {
         @click="store.openRestoreModal()"
       >↩ 恢复片段</button>
 
+      <!-- 采样流程库：新建/编辑/重命名/复制/删除 + 导入导出（片段的流程选择在卡片 ⊞ 下拉里） -->
+      <n-popover
+        v-model:show="showPipelineManager"
+        trigger="click"
+        placement="bottom-end"
+        :show-arrow="true"
+      >
+        <template #trigger>
+          <button
+            class="tb-btn ghost"
+            :title="`自定义采样流程（${store.pipelines.length} 份）：新建/编辑/导入导出；片段上点 ⊞ 选用`"
+          >⊞ 自定义采样流程{{ store.pipelines.length ? ` ${store.pipelines.length}` : "" }}</button>
+        </template>
+
+        <div class="pl-panel">
+          <div class="pl-head">
+            自定义采样流程
+            <span class="pl-hint">片段上点 ⊞ 选择用哪一份</span>
+          </div>
+
+          <div v-if="!store.pipelines.length" class="pl-empty">
+            还没有流程 —— 点「＋ 新建流程」搭一份，或「导入…」用别人分享的
+          </div>
+
+          <div v-else class="pl-list">
+            <div v-for="p in store.pipelines" :key="p.id" class="pl-row">
+              <div class="pl-row-main">
+                <span class="pl-name" :title="p.name">{{ p.name }}</span>
+                <span class="pl-use">{{ store.pipelineUsage(p.id) }} 张卡片引用</span>
+              </div>
+              <div class="pl-row-actions">
+                <button class="pl-btn" title="打开原生子图编辑器" @click="onEditPipeline(p.id)">编辑</button>
+                <button class="pl-btn" title="重命名" @click="startRenamePipeline(p.id)">改名</button>
+                <button class="pl-btn" title="复制为新流程（要独立改一份时用）" @click="onDuplicatePipeline(p.id)">复制</button>
+                <button class="pl-btn" title="导出为流程文件（别人可导入）" @click="onExportPipeline(p.id)">导出</button>
+                <button
+                  class="pl-btn danger"
+                  title="删除（引用它的卡片回到默认官方流程）"
+                  @click="deletingPipelineId = p.id"
+                >删除</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="pl-footer">
+            <button class="pl-btn primary" @click="onNewPipeline">＋ 新建流程</button>
+            <button class="pl-btn" title="导入流程文件（.studio-pipeline.json）" @click="pipelineFileInput?.click()">
+              导入…
+            </button>
+          </div>
+        </div>
+      </n-popover>
+      <input
+        ref="pipelineFileInput"
+        type="file"
+        accept=".json,application/json"
+        style="display: none"
+        @change="onImportPipelineFile"
+      />
+
       <!-- 画布参数（分辨率/帧率）选择器：按钮显示 WxH@fps，点击弹出选择框 -->
       <ResolutionParam
         :width="canvas.width"
@@ -312,6 +450,39 @@ function patchCanvas(p: Record<string, number>) {
         @keydown.enter="confirmName"
       />
     </n-modal>
+
+    <!-- 重命名自定义采样流程 -->
+    <n-modal
+      :show="!!renamingPipelineId"
+      preset="dialog"
+      title="重命名自定义采样流程"
+      positive-text="保存"
+      negative-text="取消"
+      @positive-click="confirmRenamePipeline"
+      @negative-click="renamingPipelineId = null"
+      @close="renamingPipelineId = null"
+    >
+      <n-input
+        v-model:value="pipelineNameInput"
+        placeholder="流程名称"
+        @keyup.enter="confirmRenamePipeline"
+      />
+    </n-modal>
+
+    <!-- 删除自定义采样流程：二次确认（引用它的卡片会回默认官方流程） -->
+    <n-modal
+      :show="!!deletingPipelineId"
+      preset="dialog"
+      title="删除自定义采样流程"
+      :content="`将删除流程「${deletingPipeline?.name ?? ''}」的定义（${
+        deletingPipeline ? store.pipelineUsage(deletingPipeline.id) : 0
+      } 张卡片正在引用），这些片段会回到默认官方采样流程。不可恢复。确定删除？`"
+      positive-text="删除"
+      negative-text="取消"
+      @positive-click="confirmDeletePipeline"
+      @negative-click="deletingPipelineId = null"
+      @close="deletingPipelineId = null"
+    />
 
     <!-- 删除任务：二次确认 -->
     <n-modal
@@ -422,5 +593,111 @@ function patchCanvas(p: Record<string, number>) {
 }
 .tb-btn.ghost {
   background: transparent;
+}
+
+/* ---------- 采样流程库面板（工具栏弹出；样式对齐 ResolutionParam 的 .res-pop 一套） ---------- */
+.pl-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 2px;
+  width: 360px;
+}
+.pl-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--dc-text);
+}
+.pl-hint {
+  margin-left: auto;
+  font-size: 10px;
+  color: var(--dc-text-faint);
+}
+.pl-empty {
+  padding: 8px;
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--dc-text-dim);
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px dashed var(--dc-border);
+  border-radius: 5px;
+}
+.pl-list {
+  display: flex;
+  flex-direction: column;
+  max-height: 46vh;
+  overflow-y: auto;
+}
+.pl-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 0;
+  border-top: 1px solid var(--dc-border);
+}
+.pl-list .pl-row:first-child {
+  border-top: none;
+}
+.pl-row-main {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+}
+.pl-name {
+  font-size: 12px;
+  color: var(--dc-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pl-use {
+  font-size: 10px;
+  color: var(--dc-text-faint);
+  font-variant-numeric: tabular-nums;
+}
+.pl-row-actions {
+  display: flex;
+  gap: 4px;
+  flex-shrink: 0;
+}
+.pl-btn {
+  height: 22px;
+  padding: 0 8px;
+  border: 1px solid var(--dc-border);
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--dc-text-dim);
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.pl-btn:hover {
+  border-color: var(--dc-accent);
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--dc-text);
+}
+.pl-btn.primary {
+  border-color: transparent;
+  background: v-bind("palette.accent");
+  color: #fff;
+}
+.pl-btn.primary:hover {
+  background: v-bind("palette.accentHover");
+  opacity: 0.9;
+}
+.pl-btn.danger:hover {
+  border-color: var(--dc-danger);
+  color: var(--dc-danger);
+}
+.pl-footer {
+  display: flex;
+  gap: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--dc-border);
 }
 </style>

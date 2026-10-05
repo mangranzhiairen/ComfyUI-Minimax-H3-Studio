@@ -185,8 +185,13 @@ class BaseTask(ABC):
     # ---------- 基类公共：真实采样链路（官方 MiniMax H3 流程） ----------
 
     def sample(self, positive, latent: dict) -> dict:
-        """官方采样节点组合（SigmaShift → BasicScheduler → Guider → SamplerCustomAdvanced），
-        每步进度经包装 guider.sample 转发 → ctx.progress。"""
+        """采样：挂了采样流程（子图）就走子图，否则走内置官方链。
+
+        内置链：SigmaShift → BasicScheduler → Guider → SamplerCustomAdvanced，
+        每步进度经包装 guider.sample 转发 → ctx.progress（前端卡片进度条）。"""
+        if self.segment.pipeline is not None:
+            return self._sample_with_pipeline(positive, latent)
+
         from ..sampling import sample_single_stage
 
         s = self.ctx.sampling
@@ -205,11 +210,55 @@ class BaseTask(ABC):
             progress=self._ksampler_progress(),
         )
 
-    def _ksampler_progress(self):
-        """采样每步回调 → ctx.progress(seg_id, 'sampling', 0~1)（前端卡片进度条用）。
+    def _sample_with_pipeline(self, positive, latent: dict) -> dict:
+        """执行该片段绑定的采样流程（前端摊平图 → 官方零件调度，见 studio/pipeline.py）。
 
-        回调签名与采样器 sample 的 callback 对齐：callback(step, x0, x, total_steps)，
-        经包装 guider.sample 注入（见 sampling.sample_single_stage）。
+        进度/预览：把逐步回调挂到 model 上（OUTER_SAMPLE 包装器，见
+        sampling.attach_sampler_progress），因此用户链里**每段采样**都会推进进度条、
+        推送 x0 给 live 预览（与内置链同一条 studio_progress / studio_preview 通道）。
+        极少数不含采样的流程（纯 latent 运算）没有逐步回调，只有首尾两次粗略进度。
+        """
+        from ..pipeline import PipelineError, run_pipeline_graph
+        from ..sampling import build_pipeline_runtime
+
+        pipeline = self.segment.pipeline
+        assert pipeline is not None
+        s = self.ctx.sampling
+        runtime = build_pipeline_runtime(
+            model=self.ctx.model,
+            positive=positive,
+            latent=latent,
+            seed=s.seed,
+            steps=s.steps,
+            sampler_name=s.sampler,
+            scheduler=s.scheduler,
+            shift_video=s.shift_video,
+            shift_audio=s.shift_audio,
+            on_step=self._ksampler_progress(),
+        )
+        self._report("sampling", 0.0)
+        try:
+            return run_pipeline_graph(
+                pipeline.graph,
+                runtime,
+                prompt_id=f"studio-pipeline-{self.segment.id}",
+            )
+        except PipelineError as exc:
+            # 采样流程的问题要能一眼分清"我（用户）违规了"还是"插件坏了"，
+            # 因此统一带上片段与流程名（PipelineError 的消息本身已是用户可读中文）。
+            raise PipelineError(
+                f"片段 {self.segment.id} 的采样流程「{pipeline.name}」无法执行：{exc}"
+            ) from exc
+        finally:
+            self._report("sampling", 1.0)
+
+    def _ksampler_progress(self):
+        """采样每步回调 → ctx.progress(seg_id, 'sampling', 0~1)（前端卡片进度条 + live 预览）。
+
+        签名与采样器的逐步回调对齐：callback(step, x0, x, total_steps)。两条注入路径：
+        - 内置链：包装 `guider.sample`（见 sampling.sample_single_stage）
+        - 采样流程（子图）：挂在 model 上的 OUTER_SAMPLE 包装器
+          （见 sampling.attach_sampler_progress），链上每段采样都会触发
         """
         cb = self.ctx.progress
         if cb is None:

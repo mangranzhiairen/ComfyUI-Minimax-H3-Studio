@@ -226,6 +226,198 @@ def sample_single_stage(
     return out
 
 
+def build_pipeline_runtime(
+    *,
+    model,
+    positive,
+    latent: dict,
+    seed: int,
+    steps: int,
+    sampler_name: str,
+    scheduler: str,
+    shift_video: float = 12.0,
+    shift_audio: float = 3.0,
+    on_step=None,
+):
+    """构造采样流程（子图）骨架槽的运行时值 —— 惰性求值，只有被用到的槽才算。
+
+    语义对齐内置官方链（`sample_single_stage`）：
+
+    | 槽 | 值 |
+    |---|---|
+    | conditioning | 条件（positive） |
+    | latent | AV 空 latent |
+    | model | **已做 SigmaShift 的模型**（shift_video/audio 取节点 widget） |
+    | scheduler | 用上面这个模型算出的 **SIGMAS**（scheduler/steps，denoise=1.0） |
+    | sampler | KSamplerSelect(sampler_name) |
+    | noise | RandomNoise(seed) |
+
+    这样"官方等价模型"（子图里 BasicGuider + KSamplerSelect + RandomNoise +
+    SamplerCustomAdvanced，接 model/conditioning/sampler/noise/scheduler/latent）
+    跑出来应与不挂采样流程时一致，可作为回归基准。用户也可以不用 model/scheduler，
+    在子图里自己拉偏移/调度链（那时这两槽就不求值，零额外开销）。
+
+    `on_step`：逐步回调 `(step, x0, x, total_steps)`。给了就把它挂到 model 上
+    （OUTER_SAMPLE 包装器，见 `attach_sampler_progress`），这样**用户链里有几段采样都能**拿到
+    进度与 x0（进度条 + live 预览），不依赖对方用哪个 guider/sampler 节点。
+    """
+    from .pipeline import PipelineRuntime
+
+    from comfy_extras.nodes_custom_sampler import (
+        BasicScheduler,
+        KSamplerSelect,
+        RandomNoise,
+    )
+
+    memo: dict[str, Any] = {}
+
+    def _once(key: str, factory):
+        if key not in memo:
+            memo[key] = factory()
+        return memo[key]
+
+    def shifted_model():
+        _, _, SigmaShift = _load_minimax_nodes()
+        out = SigmaShift.execute(model, float(shift_video), float(shift_audio))
+        return unpack_node_output(out)[0]
+
+    def sigmas():
+        out = BasicScheduler.execute(
+            _once("model", shifted_model), str(scheduler), int(steps), 1.0
+        )
+        return unpack_node_output(out)[0]
+
+    def model_slot():
+        """model 槽：偏移后的模型 + 逐步回调包装器（挂在模型上，链上每段采样都触发）。"""
+        m = _once("model", shifted_model)
+        return attach_sampler_progress(m, on_step) if on_step is not None else m
+
+    return PipelineRuntime(
+        providers={
+            "conditioning": lambda: positive,
+            "latent": lambda: latent,
+            "model": model_slot,
+            "scheduler": lambda: _once("sigmas", sigmas),
+            "sampler": lambda: _once(
+                "sampler", lambda: unpack_node_output(KSamplerSelect.execute(str(sampler_name)))[0]
+            ),
+            "noise": lambda: _once(
+                "noise", lambda: unpack_node_output(RandomNoise.execute(int(seed)))[0]
+            ),
+        }
+    )
+
+
+def _nested_latent_view(x0, latent_shapes):
+    """把回调里的 x0 还原成「嵌套（AV）视图」。
+
+    ⚠️ 必须做这一步：我们的包装器挂在 `OUTER_SAMPLE` 上，而
+    `comfy/samplers.py: CFGGuider.sample` 是这样组织的 ——
+
+        if latent_image.is_nested:
+            latent_image, latent_shapes = pack_latents(latent_image.unbind())   # AV → 扁平
+        if len(latent_shapes) > 1 and callback is not None:
+            packed_callback = callback
+            def callback(step, x0, x, total_steps):          # 在这一层还原成嵌套视图
+                x0 = NestedTensor(unpack_latents(x0, latent_shapes))
+                return packed_callback(step, x0, x, total_steps)
+        executor = WrapperExecutor.new_class_executor(self.outer_sample, ...)   # ← 我们在这层内
+
+    也就是说：采样器交给我们的 x0 是**打包后的扁平张量**，而下面的 nested→callback 包装器
+    在更外层。studio 的 TAE live 预览要求 5D 视频流（`video_stream()`），不还原就会
+    静默不出预览（进度条不受影响，因为它不看 x0）。
+    KJNodes 的 `_normalize_packed_x0()` 做的正是同一件事。
+    """
+    if x0 is None or latent_shapes is None or len(latent_shapes) <= 1:
+        return x0
+    if hasattr(x0, "tensors") or not torch.is_tensor(x0):  # 已经是嵌套/非张量：不动
+        return x0
+    try:
+        import comfy.nested_tensor
+        import comfy.utils
+
+        return comfy.nested_tensor.NestedTensor(comfy.utils.unpack_latents(x0, latent_shapes))
+    except Exception:  # noqa: BLE001 还原失败就按原样交出去（预览会自行降级）
+        return x0
+
+
+class SamplerProgressWrapper:
+    """挂在 model 上的 `OUTER_SAMPLE` 包装器：逐步回调 → studio 进度/live 预览。
+
+    **为什么挂在 model 上而不是采样节点上**（同 KJNodes `ModelPreviewOverride` 的做法）：
+    ComfyUI 的 guider（BasicGuider / CFGGuider…）在 `sample()` 里会把
+    `model_options[WrappersMP.OUTER_SAMPLE]` 的所有包装器串成 WrapperExecutor，
+    再执行真正的采样（comfy/samplers.py: `outer_sample` / `WrapperExecutor`）。
+    因此只要模型里带了包装器，**用户链里有几段采样、用哪个 guider/sampler 节点都能拿到**：
+
+    - `sigmas` → 本段总步数
+    - `callback(step, x0, x, total_steps)` → 每一步的 x0（进度条 + live 预览都靠它）
+
+    我们只包一层回调：先把 x0 还原成嵌套视图转给 studio（进度/预览），再原样调用官方回调，
+    不影响官方预览链。
+    """
+
+    def __init__(self, on_step):
+        self.on_step = on_step
+
+    def __call__(
+        self,
+        executor,
+        noise,
+        latent_image,
+        sampler,
+        sigmas,
+        denoise_mask=None,
+        callback=None,
+        disable_pbar=False,
+        seed=None,
+        latent_shapes=None,
+    ):
+        on_step = self.on_step
+
+        def wrapped_callback(step, x0, x, total_steps):
+            if on_step is not None:
+                try:
+                    # x0 交给 studio 前还原成 AV 嵌套视图（TAE 预览要 5D 视频流）
+                    on_step(step, _nested_latent_view(x0, latent_shapes), x, total_steps)
+                except Exception:  # noqa: BLE001 进度/预览失败绝不能影响采样
+                    log.debug("采样进度回调异常", exc_info=True)
+            if callback is not None:
+                callback(step, x0, x, total_steps)
+
+        return executor(
+            noise,
+            latent_image,
+            sampler,
+            sigmas,
+            denoise_mask,
+            wrapped_callback,
+            disable_pbar,
+            seed,
+            latent_shapes=latent_shapes,
+        )
+
+
+def attach_sampler_progress(model, on_step):
+    """给模型挂上逐步回调（cloned ModelPatcher，共享权重，代价很小）。
+
+    挂不上（老版本没有 patcher_extension）时退回原模型：进度/预览缺失但采样照跑。
+    """
+    if on_step is None:
+        return model
+    try:
+        from comfy.patcher_extension import WrappersMP
+
+        patcher = model.clone()
+        patcher.add_wrapper_with_key(
+            WrappersMP.OUTER_SAMPLE, "studio_progress", SamplerProgressWrapper(on_step)
+        )
+        return patcher
+    except Exception as exc:  # noqa: BLE001
+        log.warning("挂采样进度包装器失败（进度条/live 预览将不可用）：%s", exc)
+        return model
+
+
 def empty_audio_dict() -> dict[str, Any]:
     """静音/无音频输出占位（ComfyUI AUDIO 结构）。"""
     return {

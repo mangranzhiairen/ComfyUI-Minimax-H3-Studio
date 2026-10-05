@@ -56,6 +56,47 @@ class MediaRef:
     kind: str  # "image" | "video" | "audio"
 
 
+# ---------- 片段级采样流程（子图） ----------
+# 前端在原生子图编辑器里搭采样链，摊平（方案 A：前端自己展开）后随 payload 发来：
+#   clips[].pipeline = { id, name, graph: {version, inputs, nodes, output, warnings} }
+# 后端只消费摊平图（不认识前端子图定义），执行见 studio/pipeline.py。
+
+
+@dataclass(frozen=True)
+class PipelineNode:
+    """平铺图里的一个节点（ComfyUI API 格式）。"""
+
+    class_type: str
+    inputs: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class PipelineGraph:
+    """摊平后的可执行图。
+
+    - inputs：骨架输入槽（顺序 = 前端槽顺序；运行时按**名字**喂值）
+    - nodes：`{节点id: {class_type, inputs}}`，输入值可以是字面量，也可以是
+      `[上游节点id, 输出槽]` 连线；`["__studio__", "<槽名>"]` 表示 studio 运行时提供
+    - output：`[节点id, 输出槽]`，即子图输出槽接的是谁
+    - warnings：前端摊平时发现的软问题（缺输出连线等），执行报错时一并回显
+    """
+
+    version: int
+    inputs: tuple[dict[str, str], ...]
+    nodes: dict[str, PipelineNode]
+    output: tuple[str, int] | None
+    warnings: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ClipPipeline:
+    """片段绑定的采样流程（未绑定时 ClipPayload.pipeline 为 None）。"""
+
+    id: str
+    name: str
+    graph: PipelineGraph | None
+
+
 @dataclass(frozen=True)
 class CanvasConfig:
     fps: int = 24
@@ -81,6 +122,8 @@ class ClipPayload:
     # 抽卡级反悔：用户显式指定的历史采样指纹（16 位 hex）。指定后该片段跳过采样，
     # 直接用这份 latent 出片（seed 等采样参数取历史记录，不受当前节点 widget 影响）
     sample_fp: str | None = None
+    # 片段级采样流程（子图）：有则用它的摊平图采样，没有则走内置官方链
+    pipeline: ClipPipeline | None = None
 
     def frames(self, fps: float) -> int:
         """对齐 17k+5 网格后的采样帧数。"""
@@ -166,6 +209,102 @@ def _parse_clip(raw: Any, index: int) -> ClipPayload:
         continuity=bool(raw.get("continuity", False)),
         sample_fp=_parse_fingerprint(
             raw.get("sampleFp"), index, clip_id, field="sampleFp"
+        ),
+        pipeline=_parse_pipeline(raw.get("pipeline"), index, clip_id),
+    )
+
+
+def _parse_pipeline(raw: Any, index: int, clip_id: str) -> ClipPipeline | None:
+    """解析片段级采样流程（子图）。
+
+    **结构校验**在这里（形状/类型）；**语义校验**（节点是否存在、骨架槽是否合法、
+    有没有环）在执行时做（见 studio/pipeline.py）——那需要 ComfyUI 的节点表，
+    而本模块要保持"纯函数、可离线单测"。
+    """
+    where = f"clips[{index}] ({clip_id}).pipeline"
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise PayloadValidationError(f"{where}: 必须是对象")
+
+    pid = str(raw.get("id") or "").strip()
+    if not pid:
+        raise PayloadValidationError(f"{where}: 缺少子图 id")
+    name = str(raw.get("name") or "").strip() or pid
+
+    graph_raw = raw.get("graph")
+    if graph_raw is None:
+        # 前端没带摊平图（旧产物）：契约上允许，执行时会给出可读报错而不是静默降级
+        return ClipPipeline(id=pid, name=name, graph=None)
+    if not isinstance(graph_raw, dict):
+        raise PayloadValidationError(f"{where}.graph: 必须是对象")
+
+    version = graph_raw.get("version")
+    if version != 1:
+        raise PayloadValidationError(
+            f"{where}.graph: 不支持的摊平图版本 {version!r}（当前只支持 1）"
+        )
+
+    inputs_raw = graph_raw.get("inputs")
+    if not isinstance(inputs_raw, list):
+        raise PayloadValidationError(f"{where}.graph.inputs: 必须是数组")
+    inputs: list[dict[str, str]] = []
+    for slot_index, slot in enumerate(inputs_raw):
+        if not isinstance(slot, dict):
+            raise PayloadValidationError(f"{where}.graph.inputs[{slot_index}]: 必须是对象")
+        inputs.append(
+            {"name": str(slot.get("name") or ""), "type": str(slot.get("type") or "")}
+        )
+
+    nodes_raw = graph_raw.get("nodes")
+    if not isinstance(nodes_raw, dict):
+        raise PayloadValidationError(f"{where}.graph.nodes: 必须是对象")
+    nodes: dict[str, PipelineNode] = {}
+    for node_id, node in nodes_raw.items():
+        if not isinstance(node, dict):
+            raise PayloadValidationError(f"{where}.graph.nodes[{node_id}]: 必须是对象")
+        class_type = str(node.get("class_type") or "").strip()
+        if not class_type:
+            raise PayloadValidationError(
+                f"{where}.graph.nodes[{node_id}]: 缺少 class_type"
+            )
+        node_inputs = node.get("inputs")
+        if node_inputs is not None and not isinstance(node_inputs, dict):
+            raise PayloadValidationError(
+                f"{where}.graph.nodes[{node_id}].inputs: 必须是对象"
+            )
+        nodes[str(node_id)] = PipelineNode(
+            class_type=class_type, inputs=dict(node_inputs or {})
+        )
+
+    output: tuple[str, int] | None = None
+    output_raw = graph_raw.get("output")
+    if output_raw is not None:
+        if not isinstance(output_raw, (list, tuple)) or len(output_raw) != 2:
+            raise PayloadValidationError(
+                f"{where}.graph.output: 必须是 [节点id, 输出槽] 或 null"
+            )
+        try:
+            output = (str(output_raw[0]), int(output_raw[1]))
+        except (TypeError, ValueError) as exc:
+            raise PayloadValidationError(
+                f"{where}.graph.output: 必须是 [节点id, 输出槽] 或 null"
+            ) from exc
+
+    warnings_raw = graph_raw.get("warnings") or []
+    if not isinstance(warnings_raw, list):
+        raise PayloadValidationError(f"{where}.graph.warnings: 必须是数组")
+    warnings = tuple(str(w) for w in warnings_raw)
+
+    return ClipPipeline(
+        id=pid,
+        name=name,
+        graph=PipelineGraph(
+            version=int(version),
+            inputs=tuple(inputs),
+            nodes=nodes,
+            output=output,
+            warnings=warnings,
         ),
     )
 

@@ -1,4 +1,4 @@
-﻿/**
+/**
  * 时间线数据模型 —— 前后端数据契约
  *
  * 前端 Pinia store 中维护的数据，最终通过 serialize() 序列化为
@@ -49,6 +49,68 @@ export const REFERENCE_LIMITS = {
   audios: 3,
 } as const;
 
+/**
+ * 任务级采样流程库条目：一份采样流程（子图）定义。
+ *
+ * **引用模型**：片段只记 `pipelineId`，定义存在库里 —— 一份流程可挂多张卡片，
+ * 改一处所有引用它的片段都跟着变（要独立改就"复制为新流程"）。
+ * 未绑定（`pipelineId` 为空）= 走内置官方流程。
+ */
+export interface PipelineLibraryEntry {
+  /** 流程 id：前端生成的 UUID，同时作子图 id（前端按 uuid 校验 + URL hash 定位） */
+  id: string;
+  /** 显示名（下拉 / 卡片提示用） */
+  name: string;
+  /** 子图定义（ExportedSubgraph：节点 + 连线 + 预留输入输出槽） */
+  def: unknown;
+}
+
+/**
+ * @deprecated 旧的内联形态（片段自带一份定义）。
+ * 只保留用于反序列化迁移：读到它就登记进流程库并改成 `pipelineId` 引用。
+ */
+export interface LegacyInlinePipeline {
+  id: string;
+  name: string;
+  def: unknown;
+}
+
+/** 摊平后的骨架输入槽（顺序即 [__studio__, i] 的 i） */
+export interface PipelineGraphInput {
+  name: string;
+  type: string;
+}
+
+/** 平铺节点（ComfyUI API 格式：class_type + 输入表） */
+export interface PipelineGraphNode {
+  class_type: string;
+  inputs: Record<string, unknown>;
+}
+
+/**
+ * 摊平后的可执行图（**方案 A**：前端把子图定义展开成平铺节点图）。
+ *
+ * 只在「发给后端的 payload」里出现，是派生物：定义只存在流程库里（`PipelineLibraryEntry.def`），
+ * DB 不存摊平图（避免两处真相、避免陈旧副本）。后端执行时把 `[__studio__, "<槽名>"]`
+ * 换成 studio 运行时准备好的输入（当前 = conditioning / latent / noise / model / sampler / scheduler）。
+ */
+export interface PipelineGraph {
+  version: 1;
+  inputs: PipelineGraphInput[];
+  nodes: Record<string, PipelineGraphNode>;
+  /** 输出取 [节点id, 输出槽]；子图输出槽没连线时为 null */
+  output: [string, number] | null;
+  /** 摊平时的可读问题（缺输出连线 / 跳过旁路节点 / 骨架槽没用上 …） */
+  warnings: string[];
+}
+
+/** payload 里的采样流程：解析后的**引用结果**（id/name 来自流程库 + 摊平图） */
+export interface ClipPipelinePayload {
+  id: string;
+  name: string;
+  graph?: PipelineGraph;
+}
+
 /** 单个时间线片段 */
 export interface Clip {
   /** 片段唯一 ID（前端生成，保证稳定引用） */
@@ -82,6 +144,8 @@ export interface Clip {
    *  直接用这份 latent 出片（seed 等取历史记录，不受节点全局 seed 影响）。
    *  缺省 = 自动（同参数同 seed 命中复用，否则重新采样）。 */
   sampleFp?: string;
+  /** 引用的采样流程（流程库条目 id）；缺省/为空 = 内置官方流程 */
+  pipelineId?: string | null;
 }
 
 /** 画布配置（与后端 CanvasConfig 对齐） */
@@ -121,6 +185,8 @@ export interface ClipPayload {
   sourceVideo?: { path: string; kind: MediaKind };
   /** 抽卡级反悔：显式指定的历史采样指纹（后端据此跳过采样直接用该 latent） */
   sampleFp?: string;
+  /** 解析后的采样流程（引用流程库条目 + 摊平图）；缺省 = 内置官方流程 */
+  pipeline?: ClipPipelinePayload;
 }
 
 /** 时长限制 */
