@@ -183,13 +183,18 @@ def _fit_video_latent(tensor, dst_h: int, dst_w: int):
 
 
 def fit_cond_video_latents(kwargs: dict, latent_shapes) -> dict:
-    """把 conditioning 里的视频 latent 缩到**当级采样**的网格（每级一次）。
+    """把 conditioning 里**钉入的 keyframes** 缩到当级采样网格（每级一次）。
 
     在 MiniMaxH3.extra_conds 编码条件之前调用：那一刻条件才真正变成条件行，而参数里
     正好带着当级的 latent_shapes（comfy/samplers.py: process_conds → encode_model_conds
     → extra_conds）。keyframes 从 FIT_SOURCE_KEY 保存的原始块出发缩放（图里放大过时，
-    第二级若正好是原生网格就是零重采样）；用户自带的锚点/参考图没有原始块，就从当前值
-    缩一次（条件本身不被就地改写，所以每一级都从同一份出发，可重复）。
+    第二级若正好是原生网格就是零重采样）；用户自带的锚点没有原始块，就从当前值缩一次
+    （条件本身不被就地改写，所以每一级都从同一份出发，可重复）。
+
+    ⚠️ 只有 minimax_keyframes 吃目标网格（PackedLayout：n = vt * frame_rows，注释写明
+    "sharing the target spatial grid"）。**minimax_refs（参考图/参考视频）用的是它自己
+    的网格**（_frame_grid(blk["latent_h"], blk["latent_w"])），把它们的 latent 缩了却不同步
+    latent_h/latent_w 会让行数对不上（实测报 [3726,96] vs [3543,96]），所以这里绝不碰 refs。
     """
     try:
         shapes = list(latent_shapes or [])
@@ -203,7 +208,8 @@ def fit_cond_video_latents(kwargs: dict, latent_shapes) -> dict:
         return kwargs
 
     out = kwargs
-    for key in ("minimax_keyframes", "minimax_refs"):
+    # 只处理 keyframes：refs 自带网格元数据（latent_h/latent_w），与目标网格无关，不能缩
+    for key in ("minimax_keyframes",):
         items = kwargs.get(key)
         if not isinstance(items, list) or not items:
             continue

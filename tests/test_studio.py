@@ -469,12 +469,34 @@ class ContextConformTest(unittest.TestCase):
         self.assertEqual(tuple(got2.shape)[-2:], (12, 16))
         self.assertTrue(torch.equal(got2, src))  # 原生网格：逐元素等于原件，没有二次插值
         self.assertIs(got2, src)  # 同网格时连拷贝都没有：直接原样返回原件本身
-        # 没有 keyframes/refs 的条件（例如负条件）原样返回，一点动作都没有
+        # 没有 keyframes 的条件（例如负条件）原样返回，一点动作都没有
         untouched: dict = {}
         self.assertIs(fit_cond_video_latents(untouched, [(1, 24, 57, 6, 8)]), untouched)
 
         # 入参不被就地改写（每一级都从同一份出发，可重复）
         self.assertEqual(tuple(kwargs["minimax_keyframes"][0]["latent"].shape)[-2:], (6, 8))
+
+    def test_fit_cond_video_latents_leaves_refs_alone(self):
+        """参考图/参考视频用**自己的**网格（latent_h/latent_w 记账），绝不能按目标网格缩。
+
+        缩了 latent 却不同步 latent_h/latent_w，PackedLayout 的行数就和条件行对不上
+        —— 真机上报过 [3726,96] vs [3543,96]。
+        """
+        import torch
+
+        from studio.motion_context import fit_cond_video_latents
+
+        ref = {
+            "kind": "image",
+            "latent": torch.zeros(1, 24, 1, 10, 12),
+            "latent_h": 10,
+            "latent_w": 12,
+        }
+        kwargs = {"minimax_refs": [ref]}
+        out = fit_cond_video_latents(kwargs, [(1, 24, 57, 6, 8), (1, 32, 2, 300)])
+        self.assertIs(out, kwargs)  # 整份原样返回
+        self.assertIs(out["minimax_refs"][0]["latent"], ref["latent"])  # 张量也没被替换
+
 
     def test_install_cond_grid_fit_patches_and_restores(self):
         """按级缩放钩子：装上后 extra_conds 前会缩；卸下后原方法回来（嵌套按层计数）。"""
