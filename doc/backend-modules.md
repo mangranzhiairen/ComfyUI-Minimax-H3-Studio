@@ -136,13 +136,15 @@ tasks            id / node_id / name / timeline(时间线当前完整数据 JSON
                  / sampling_json / status / created_at / updated_at
 clip_versions    历史版本（纯 Model）：id / task_id / clip_id / content_fp / canvas / snapshot / created_at
 version_samples  采样记录：id / task_id / clip_id / version_id / content_fp / canvas / sample_fp
-                 / seed / duration_sec / continuity / frames / sample_len / created_at
+                 / seed / duration_sec / continuity / frames / sample_len
+                 / latent_width / latent_height / created_at
                  UNIQUE(task_id, clip_id, sample_fp)
 pipeline_library 全局采样流程库（**跨任务共享，不属于任何任务**）：id / name / def(子图 JSON) / updated_at
                  —— 片段只存 pipelineId 引用；新建/切换/删除任务都不动它
 ```
 
 - 历史只在采样成功时固化（`record_version_sample`）：同 clip 同 content_fp 复用条目，否则新建；样本 INSERT OR REPLACE。
+- **实际 latent 尺寸**（`latent_width/latent_height`）：采样结束、释放前由 `context_conform.latent_pixel_size` 从 AV latent 视频流读出（网格 × VAE 空间压缩比 16）。自定义采样流程（子图）可能二采放大，最终 latent 与采样画布不再是 1:1——`canvas` 只描述画布，实际出片尺寸以这里为准；`get_clip_history` 返回 `latentWidth/latentHeight`（旧样本为 null），前端历史面板据此显示并在与画布不一致时高亮。
 - **全局采样流程库**（`pipeline_library`）：流程是**可复用的工艺资产**，不属于某条片子——放任务里会随任务切换消失，也无法一处改到处生效。接口是「读全库 / 覆盖式整库保存」`GET|PUT /pipelines`（与 timeline 同款：前端权威 + DB 纯持久化），`save_pipeline_library` 在一个事务里整库替换（半更新的库比旧库更糟：会出现指向不存在定义的引用）。
   - 前端守卫 `pipelinesLoaded`：**没读到库里已有定义就拒绝整库回写**（否则空库覆盖 = 把用户的全部自定义流程删光）；后端再加一道：空覆盖非空库必须显式 `confirm_clear`（否则 409）。
   - 导出 `export_task` 只内嵌**被引用**的流程（`referenced_pipelines`）；`import_task` 用 `merge_pipeline_library` 按 id 并入导入方的全局库（**已存在的 id 保留本地那份**，新 id 重名自动加「（N）」后缀）。

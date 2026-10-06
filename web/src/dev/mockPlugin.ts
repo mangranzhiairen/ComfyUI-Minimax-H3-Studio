@@ -44,6 +44,9 @@ interface MockSample {
   continuity: boolean;
   frames: number;
   sampleLen: number;
+  /** 实际 latent 像素尺寸（自定义采样流程二采放大时 ≠ canvas；0/缺省 = 无记录） */
+  latentWidth?: number;
+  latentHeight?: number;
   createdAt: number;
 }
 
@@ -374,7 +377,7 @@ route("GET", "/minimax/studio/tasks/:task_id/export", async ([taskId], _req, res
   for (const clipId of Object.keys(h)) {
     history[clipId] = {
       versions: h[clipId].versions.map((v) => ({ versionId: v.versionId, contentFp: v.contentFp, canvas: v.canvas, snapshot: v.snapshot, createdAt: v.createdAt })),
-      samples: h[clipId].samples.map((s) => ({ versionId: s.versionId, contentFp: s.contentFp, canvas: s.canvas, sampleFp: s.sampleFp, seed: s.seed, durationSec: s.durationSec, continuity: s.continuity, frames: s.frames, sampleLen: s.sampleLen, createdAt: s.createdAt })),
+      samples: h[clipId].samples.map((s) => ({ versionId: s.versionId, contentFp: s.contentFp, canvas: s.canvas, sampleFp: s.sampleFp, seed: s.seed, durationSec: s.durationSec, continuity: s.continuity, frames: s.frames, sampleLen: s.sampleLen, latentWidth: s.latentWidth, latentHeight: s.latentHeight, createdAt: s.createdAt })),
     };
   }
   const timeline = safeParse(t.timeline) as { clips?: { pipelineId?: string }[] };
@@ -451,6 +454,8 @@ route("POST", "/minimax/studio/tasks/import", async (_p, req, res) => {
       continuity: Boolean(s?.continuity),
       frames: Number(s?.frames) || 0,
       sampleLen: Number(s?.sampleLen) || 0,
+      latentWidth: Number(s?.latentWidth) || undefined,
+      latentHeight: Number(s?.latentHeight) || undefined,
       createdAt: Number(s?.createdAt) || Date.now() / 1000,
     }));
     hist[clipId] = { versions, samples };
@@ -558,6 +563,10 @@ route("POST", "/minimax/dev/sample", async (_p, req, res) => {
   const clipId = String(clip.id || "");
   const canvas = String(b?.canvas || "");
   const durationSec = Number(b?.durationSec) || 4;
+  // 实际 latent 尺寸：默认等于画布；调用方可传（模拟自定义采样流程二采放大）
+  const canvasPx = /^(\d+)x(\d+)@/.exec(canvas);
+  const latentWidth = Number(b?.latentWidth) || Number(canvasPx?.[1]) || 0;
+  const latentHeight = Number(b?.latentHeight) || Number(canvasPx?.[2]) || 0;
   if (!state.tasks.has(taskId) || !clipId) return json(res, 400, { error: "缺少 task_id 或 clip" });
 
   const h = state.hist.get(taskId)!;
@@ -593,6 +602,8 @@ route("POST", "/minimax/dev/sample", async (_p, req, res) => {
     continuity: Boolean(clip.continuity),
     frames: Math.round(durationSec * 24),
     sampleLen: Math.round(durationSec * 24),
+    latentWidth,
+    latentHeight,
     createdAt: Date.now() / 1000,
   });
   json(res, 200, { ok: true, sampleFp });

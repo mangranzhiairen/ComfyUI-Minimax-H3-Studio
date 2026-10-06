@@ -131,7 +131,8 @@ def preview_url(node_id: str, sample_fp: str) -> str:
 # 表结构版本（PRAGMA user_version）：记录这一份库经历过哪些演进步骤。
 # 取代早期的"结构不符 → 删库重建"——库是用户资产，只允许就地升级。
 # 2 = 只增不减的结构演进基建；3 = + pipeline_library（全局采样流程库）+ 内联流程收编
-_SCHEMA_VERSION = 3
+# 4 = + version_samples.latent_width/latent_height（记录实际 latent 像素尺寸，二采放大后与画布不同）
+_SCHEMA_VERSION = 4
 
 # 建表 DDL（幂等）。init_db() 每次都执行一遍：缺表就地补表，缺列就地补列。
 _SCHEMA_SQL = """
@@ -162,6 +163,8 @@ CREATE TABLE IF NOT EXISTS clip_versions (
 -- 画布 canvas + 时长 duration_sec（锁定出片时据此恢复任务分辨率与片段时长）；
 -- seed 保留作抽卡标识（并参与缓存命中）。采样工艺（steps/sampler/cfg 等）
 -- 不记录——无法从 latent 恢复，展示无意义。
+-- latent_width/latent_height：**实际 latent 的像素尺寸**。自定义采样流程（子图）可能
+-- 二采放大，最终 latent 网格与画布不再是 1:1，canvas 不足以判断复用是否尺寸匹配。
 CREATE TABLE IF NOT EXISTS version_samples (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id      INTEGER,
@@ -175,6 +178,8 @@ CREATE TABLE IF NOT EXISTS version_samples (
     continuity   INTEGER,
     frames       INTEGER,
     sample_len   INTEGER,
+    latent_width  INTEGER,
+    latent_height INTEGER,
     created_at   REAL,
     UNIQUE (task_id, clip_id, sample_fp)
 );
@@ -220,6 +225,8 @@ _SCHEMA_COLUMNS: dict[str, dict[str, str]] = {
         "continuity": "INTEGER",
         "frames": "INTEGER",
         "sample_len": "INTEGER",
+        "latent_width": "INTEGER",
+        "latent_height": "INTEGER",
         "created_at": "REAL",
     },
     "pipeline_library": {
@@ -589,6 +596,8 @@ def record_version_sample(
     canvas: str = "",
     duration_sec: float = 0.0,
     continuity: bool = False,
+    latent_width: int = 0,
+    latent_height: int = 0,
 ) -> int:
     """采样成功后固化提示词条目（纯 Model）+ 采样记录挂其下，返回归属的 version_id。
 
@@ -597,6 +606,8 @@ def record_version_sample(
     canvas/duration_sec：样本携带的规格（锁定出片时前端据此恢复任务分辨率与
     片段时长）；采样工艺（steps/sampler/cfg…）不落库（无法从 latent 恢复），
     仅 sampling.seed 取作抽卡标识。
+    latent_width/latent_height：实际 latent 的像素尺寸（自定义采样流程二采放大时
+    ≠ canvas；前端据此显示并高亮）。读不出时为 0，前端按无记录处理。
     """
     init_db()
     tid = _tid(task_id)
@@ -626,12 +637,13 @@ def record_version_sample(
         conn.execute(
             "INSERT OR REPLACE INTO version_samples"
             " (task_id, clip_id, version_id, content_fp, canvas, sample_fp, seed,"
-            "  duration_sec, continuity, frames, sample_len, created_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "  duration_sec, continuity, frames, sample_len, latent_width, latent_height, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 tid, str(clip_id), version_id, content_fp, canvas, sample_fp,
                 int(sampling.get("seed", 0)), float(duration_sec),
-                int(bool(continuity)), int(frames), int(sample_len or frames), now,
+                int(bool(continuity)), int(frames), int(sample_len or frames),
+                int(latent_width or 0), int(latent_height or 0), now,
             ),
         )
         return int(version_id)
@@ -868,7 +880,7 @@ def get_clip_history(task_id, canvas: str | None = None) -> dict:
         ).fetchall()
         sample_rows = conn.execute(
             "SELECT version_id, clip_id, content_fp, canvas, sample_fp, seed,"
-            " duration_sec, continuity, frames, sample_len, created_at"
+            " duration_sec, continuity, frames, sample_len, latent_width, latent_height, created_at"
             " FROM version_samples WHERE task_id = ? AND (canvas = ? OR ? IS NULL)"
             " ORDER BY created_at DESC",
             (tid, canvas, canvas),
@@ -905,6 +917,9 @@ def get_clip_history(task_id, canvas: str | None = None) -> dict:
                 "continuity": bool(r["continuity"]),
                 "frames": r["frames"],
                 "sampleLen": r["sample_len"],
+                # 实际 latent 像素尺寸（二采放大时 ≠ canvas）；0/缺失 = 旧样本无记录
+                "latentWidth": int(r["latent_width"] or 0) or None,
+                "latentHeight": int(r["latent_height"] or 0) or None,
                 "createdAt": r["created_at"],
                 "exists": bool(node_id) and latent_exists(node_id, r["sample_fp"]),
                 "previewUrl": preview_url(node_id, r["sample_fp"]),
@@ -1054,14 +1069,15 @@ def import_task(data: dict, node_id: str) -> int:
                     conn.execute(
                         "INSERT OR REPLACE INTO version_samples"
                         " (task_id, clip_id, version_id, content_fp, canvas, sample_fp, seed,"
-                        "  duration_sec, continuity, frames, sample_len, created_at)"
-                        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        "  duration_sec, continuity, frames, sample_len, latent_width, latent_height, created_at)"
+                        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         (
                             tid, str(clip_id), new_vid, str(s.get("contentFp") or ""),
                             str(s.get("canvas") or ""), str(s.get("sampleFp") or ""),
                             int(s.get("seed") or 0), float(s.get("durationSec") or 0),
                             int(bool(s.get("continuity"))),
                             int(s.get("frames") or 0), int(s.get("sampleLen") or 0),
+                            int(s.get("latentWidth") or 0), int(s.get("latentHeight") or 0),
                             float(s.get("createdAt") or now),
                         ),
                     )

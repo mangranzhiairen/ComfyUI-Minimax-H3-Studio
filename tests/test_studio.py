@@ -305,6 +305,19 @@ class ContextConformTest(unittest.TestCase):
         self.assertIs(conform_context_latent(latent, target_video_hw=(6, 8)), latent)
         self.assertEqual(video_hw(latent), (6, 8))
 
+    def test_latent_pixel_size_reads_actual_grid(self):
+        """实际 latent 像素尺寸 = 视频流网格 × VAE 空间压缩比（二采放大后仍准）。"""
+        from studio.context_conform import VAE_SPATIAL_RATIO, latent_pixel_size
+
+        self.assertEqual(VAE_SPATIAL_RATIO, 16)
+        # 画布 864x480 的常规网格是 54x30 → 864x480；二采放大到 108x60 → 1728x960
+        self.assertEqual(latent_pixel_size(self._latent(12, 30, 54)), (864, 480))
+        self.assertEqual(latent_pixel_size(self._latent(12, 60, 108)), (1728, 960))
+        # 读不出来返回 None（不阻断采样；旧样本按无记录处理）
+        self.assertIsNone(latent_pixel_size(None))
+        self.assertIsNone(latent_pixel_size({}))
+        self.assertIsNone(latent_pixel_size({"samples": None}))
+
     def test_conform_preserves_audio_and_metadata(self):
         import torch
 
@@ -919,6 +932,73 @@ class PipelineLibraryTest(DatabaseTestBase):
         self.assertEqual(items[0]["def"]["nodes"][0]["payload"], "round")
         stored = json.loads(self.sc.get_task(new_tid)["timeline"])
         self.assertEqual(stored["clips"][0]["pipelineId"], "p_rt")
+
+
+class VersionSampleLatentSizeTest(DatabaseTestBase):
+    """采样记录里的实际 latent 尺寸（二采放大后 ≠ 画布）：落库、读回、导出/导入往返。"""
+
+    def _record(self, **overrides):
+        tid = self.sc.create_task("node1", json.dumps({"clips": []}), {}, name="尺寸")
+        fields = dict(
+            task_id=tid,
+            clip_id="clip_a",
+            content_fp="content_abc",
+            sample_fp="sample_abc",
+            snapshot={},
+            sampling={"seed": 7},
+            frames=124,
+            sample_len=146,
+            canvas="864x480@24",
+            duration_sec=5.0,
+            continuity=False,
+            latent_width=1728,
+            latent_height=960,
+        )
+        fields.update(overrides)
+        version_id = self.sc.record_version_sample(**fields)
+        return tid, version_id
+
+    def test_history_returns_actual_latent_size(self):
+        tid, _ = self._record()
+        samples = self.sc.get_clip_history(tid)["clip_a"]["samples"]
+        self.assertEqual(len(samples), 1)
+        self.assertEqual(samples[0]["latentWidth"], 1728)
+        self.assertEqual(samples[0]["latentHeight"], 960)
+        self.assertEqual(samples[0]["canvas"], "864x480@24")  # 画布仍在，二者不同
+
+    def test_missing_latent_size_reads_back_as_none(self):
+        """旧样本/读不出尺寸：0 落库，历史接口返回 null（前端显示 N/A）。"""
+        tid, _ = self._record(latent_width=0, latent_height=0)
+        sample = self.sc.get_clip_history(tid)["clip_a"]["samples"][0]
+        self.assertIsNone(sample["latentWidth"])
+        self.assertIsNone(sample["latentHeight"])
+
+    def test_export_import_round_trip_preserves_latent_size(self):
+        tid, _ = self._record()
+        exported = self.sc.export_task(tid)
+        new_tid = self.sc.import_task(exported, "node1")
+        sample = self.sc.get_clip_history(new_tid)["clip_a"]["samples"][0]
+        self.assertEqual(sample["latentWidth"], 1728)
+        self.assertEqual(sample["latentHeight"], 960)
+
+    def test_legacy_db_gains_latent_size_columns(self):
+        """只增不减的结构演进：旧库就地补 latent_width/latent_height 两列。"""
+        import sqlite3
+
+        db = self.sc.db_path()
+        db.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(db) as conn:
+            conn.execute(
+                "CREATE TABLE version_samples ("
+                " id INTEGER PRIMARY KEY AUTOINCREMENT, task_id INTEGER, clip_id TEXT,"
+                " sample_fp TEXT, sample_len INTEGER, frames INTEGER)"
+            )
+        self.sc._schema_ready.clear()
+        self.sc.init_db()
+        with self._raw() as conn:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(version_samples)")}
+        self.assertIn("latent_width", cols)
+        self.assertIn("latent_height", cols)
 
 
 class OfficialNodeCallTest(unittest.TestCase):

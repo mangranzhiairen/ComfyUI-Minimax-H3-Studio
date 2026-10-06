@@ -117,6 +117,23 @@ def video_hw(latent: dict | None) -> tuple | None:
     return int(video.shape[-2]), int(video.shape[-1])
 
 
+# H3 视频 VAE 的空间压缩比：`space_down = (2,2,2,2,1,1)` → prod = 16
+# （comfy/ldm/minimax/vae.py: MiniMaxH3VideoVAE.vae_ratio；解码输出 h*w 的 vae_ratio 倍）
+VAE_SPATIAL_RATIO = 16
+
+
+def latent_pixel_size(latent: dict | None) -> tuple[int, int] | None:
+    """AV latent 视频流对应的像素尺寸 (width, height)；读不出来返回 None。
+
+    自定义采样流程（子图）可能中途二采放大，最终 latent 网格与采样画布不再是 1:1；
+    落库的 canvas 只描述画布，实际出片尺寸必须读 latent 本身（采样结束、释放前）。
+    """
+    hw = video_hw(latent)
+    if hw is None:
+        return None
+    return int(hw[1]) * VAE_SPATIAL_RATIO, int(hw[0]) * VAE_SPATIAL_RATIO
+
+
 # ---------- 核心：视频流空间缩放 ----------
 
 def resize_video_latent(

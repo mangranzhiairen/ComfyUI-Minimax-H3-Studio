@@ -19,6 +19,7 @@ from typing import Any
 
 import torch
 
+from .context_conform import latent_pixel_size
 from .payload import StudioPayload, PayloadValidationError, clip_to_snapshot, load as load_payload
 from .segment_cache import (
     canvas_label,
@@ -482,6 +483,9 @@ class StudioExecutor:
                     result.av_latent,
                     float(task.segment.duration_sec or 0),
                 )
+                # 实际 latent 像素尺寸：自定义采样流程（子图）可能二采放大，最终网格
+                # 与画布不再是 1:1；趁 latent 还在内存里读出来落库（画布只是采样画布）。
+                latent_size = latent_pixel_size(result.av_latent)
                 result.av_latent = None  # 释放内存/显存
                 if ok:
                     # 历史只在采样成功时产生：固化片段版本（复用/新建）+ 采样记录
@@ -497,6 +501,8 @@ class StudioExecutor:
                         canvas=canvas_label(asdict(ctx.canvas)),
                         duration_sec=float(task.segment.duration_sec or 0),
                         continuity=use_cont,
+                        latent_width=(latent_size or (0, 0))[0],
+                        latent_height=(latent_size or (0, 0))[1],
                     )
                     _broadcast_segment_done(self.node_id)(
                         task.segment.id,
