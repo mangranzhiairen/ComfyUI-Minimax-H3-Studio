@@ -114,7 +114,7 @@ cd web && npm install && npm run build && cd ..
 ├── web/                     # 前端：Vue 3 + TS + Vite + Naive UI + Pinia
 ├── doc/                     # 模块级文档（后端 / 前端）
 ├── scripts/build_plugin.{bat,sh}  # 一键打包脚本（Windows / Linux·macOS）
-├── scripts/bump_version.py  # 升版本（写入 VERSION 并派生 npm 元数据）
+├── scripts/bump_version.py  # 升版本（只写 VERSION，唯一来源）
 ├── scripts/check_version.py # 版本一致性校验（发版门禁）
 ├── tests/test_studio.py     # 后端单测（无需 ComfyUI 环境）
 └── assets/screenshots/      # README 功能截图
@@ -132,20 +132,23 @@ cd web && npm install && npm run build && cd ..
 | 前端 `__STUDIO_VERSION__` | 构建时 | `web/vite.config.ts` 读 VERSION 注入 |
 | dev 预览 mock | dev server | 由 `web/vite.config.ts` 传参注入（mockPlugin 不自读） |
 | Release zip 命名 | 打包时 | `scripts/build_plugin.*` 读 VERSION |
-| `web/package.json` + lock | npm 元数据 | 由 bump 脚本派生，**不手改** |
+| `web/package.json` | npm 运行所需 | **不声明 version**（唯一来源只有 VERSION） |
 
-> 不要用 `npm version` 改版本 —— 它只更新 package.json/lock，不会动 `VERSION`，
-> 会立刻造成漂移。升版本一律走 `bump_version.py`。
+> 不要用 `npm version` / `npm pkg set version` —— 那会给 package.json 加回 version
+> 字段，等于又造出第二个需要手改的版本号。升版本一律走 `bump_version.py`（只写 `VERSION`）。
 
 ### 发版流程
 
 ```bash
-python scripts/bump_version.py 0.1.2    # 1. 升版本（写 VERSION + 派生 npm 元数据 + 自校验）
-scripts\build_plugin.bat                # 2. 构建前端 + 打包（zip 名与产物版本取自 VERSION）
+python scripts/bump_version.py 0.1.2    # 1. 升版本（只写 VERSION + 自校验）
+scripts\build_plugin.bat                # 2. 构建前端 + 打包（版本读 VERSION；打包前校验 dist 内嵌版本）
 python scripts/check_version.py         # 3. 发布门禁：必须全部 [OK] 才传 Release
 ```
 
-第 3 步会挡住「改了版本号但没重新构建前端」的情况 —— 那会让包里的前后端版本不一致，
+第 2 步本身也会在打包前校验 `web/dist` 内嵌的 `__STUDIO_VERSION__` 与 `VERSION` 一致，
+不一致直接失败 —— 即使 `--no-build` 复用旧产物也发不出错包。
+第 3 步进一步挡住「改了版本号但没重新构建前端」以及 npm 侧重新声明 version 的情况 ——
+那会让包里的前后端版本不一致，
 而这个版本自检正是防「浏览器缓存旧 JS 把空时间线写进工作流 json」的数据保护
 （详见[前端模块文档](doc/frontend-modules.md)），漂移等于保护失效。
 
