@@ -265,7 +265,8 @@ class StudioExecutor:
         # 但 UNET/CLIP 后续需重新加载（本任务内不再使用，无额外开销）
         self.unload_models_after = bool(unload_models_after)
 
-    def run(self, timeline_data: str | dict) -> ExecutionResult:
+    async def run_async(self, timeline_data: str | dict) -> ExecutionResult:
+        """执行任务（async：采样流程的内层节点执行需要 await，见 tasks/base.py）。"""
         # 数据契约（定死，不做历史形态兼容）：节点 timeline_data widget 由前端
         # serializeValue 填充为 JSON 字符串：
         #   {"taskId": string|null, "payload": {version, canvas, segments, totalDurationSec}}
@@ -321,7 +322,7 @@ class StudioExecutor:
 
         try:
             # 采样阶段：排列任务并执行（Task 只产出 latent）→ 写盘 → 释放
-            results, sampled = self._sample_all(tasks, ctx, sampling_dict, task_id)
+            results, sampled = await self._sample_all(tasks, ctx, sampling_dict, task_id)
             # 采样完成 → 解码前：可选卸载采样模型（UNET/CLIP）并清显存缓存，
             # 显存让给 VAE 解码；VAE 保留避免重载
             if self.unload_models_after:
@@ -400,7 +401,7 @@ class StudioExecutor:
         if problems:
             raise PayloadValidationError("采样前校验失败：\n- " + "\n- ".join(problems))
 
-    def _sample_all(
+    async def _sample_all(
         self,
         tasks: list,
         ctx: TaskContext,
@@ -464,7 +465,7 @@ class StudioExecutor:
 
             # 段间引导：该片段启用续接且存在上一段 latent 时从磁盘加载
             prev_av = load_av_latent(prev_file) if use_cont else None
-            result = task.execute(prev_av=prev_av)
+            result = await task.execute(prev_av=prev_av)
             if prev_av is not None:
                 del prev_av
             result.segment_index = index

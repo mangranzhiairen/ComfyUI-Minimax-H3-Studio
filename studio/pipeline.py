@@ -20,9 +20,7 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
-import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Mapping, NamedTuple
 
@@ -281,35 +279,7 @@ async def _run_nodes(
     return outputs
 
 
-def _run_async(coro) -> Any:
-    """在同步上下文里跑 coroutine。
-
-    Studio 节点目前是同步 `execute`（V1），但调用方将来若改成 async（在事件循环里），
-    直接 `asyncio.run` 会抛 "cannot be called from a running event loop"，因此这里探测
-    本线程是否有运行中的循环，有就另起线程跑（结果/异常原样带回）。
-    """
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return asyncio.run(coro)
-
-    box: dict[str, Any] = {}
-
-    def _worker() -> None:
-        try:
-            box["value"] = asyncio.run(coro)
-        except BaseException as exc:  # noqa: BLE001 原样带回
-            box["error"] = exc
-
-    thread = threading.Thread(target=_worker, name="studio-pipeline", daemon=True)
-    thread.start()
-    thread.join()
-    if "error" in box:
-        raise box["error"]
-    return box["value"]
-
-
-def run_pipeline_graph(
+async def run_pipeline_graph(
     graph: PipelineGraph | None,
     runtime: PipelineRuntime,
     *,
@@ -319,6 +289,11 @@ def run_pipeline_graph(
     """执行摊平图，返回输出槽的值（AV latent）。
 
     `runtime` 提供骨架输入；返回值为输出槽的第一个（单元素列表自动脱壳）值。
+
+    async：内层节点走 ComfyUI 官方执行器（`get_output_data` 是 coroutine）。Studio 节点
+    本身也是 async，于是这里直接 await —— 全程在 ComfyUI 的事件循环线程里，**不再另起
+    线程**做 CUDA（自建线程 + 跨线程张量生命周期会在中断时触发 cudaMallocAsync 报
+    CUDA_ERROR_INVALID_VALUE 并把进程 abort）。
     """
     validate_graph(graph)
     assert graph is not None  # validate_graph 已保证
@@ -327,9 +302,7 @@ def run_pipeline_graph(
     out_slot = int(graph.output[1])  # type: ignore[index]
 
     order = topo_order(prompt, out_node)
-    outputs = _run_async(
-        _run_nodes(prompt, order, prompt_id=prompt_id, extra_data=extra_data)
-    )
+    outputs = await _run_nodes(prompt, order, prompt_id=prompt_id, extra_data=extra_data)
 
     values = outputs.get(out_node) or []
     if out_slot >= len(values):

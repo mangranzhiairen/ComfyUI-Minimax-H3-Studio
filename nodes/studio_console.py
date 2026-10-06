@@ -80,7 +80,7 @@ class MiniMaxH3StudioConsole:
         "官方 MiniMax H3 采样（SigmaShift + KSampler）→ AV 解码输出成片。"
     )
 
-    def execute(
+    async def execute(
         self,
         timeline_data="",
         seed=0,
@@ -151,7 +151,7 @@ class MiniMaxH3StudioConsole:
             timeline_data = str(timeline_data or "")
 
         try:
-            result = executor.run(timeline_data)
+            result = await executor.run_async(timeline_data)
             report = result.report
             fps = float(result.payload.canvas.fps) if result.payload else 24.0
             frame_count = int(result.images.shape[0]) if result.images is not None else 0

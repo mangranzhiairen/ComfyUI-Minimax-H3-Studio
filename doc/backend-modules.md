@@ -85,7 +85,7 @@ studio/
 
 ## 4. 执行器（executor.py）
 
-`StudioExecutor.run(timeline_data)`：
+`StudioExecutor.run_async(timeline_data)`（**async** —— Studio 节点本身是异步 V1 节点，见 §10「执行线程」）：
 
 1. **解析**：JSON envelope → `load_payload` 严格校验。
 2. **前置校验** `_validate_locked_latent`：已启用且锁定了 `sampleFp` 的片段，其缓存画布必须等于当前画布（防解码/引导时形状崩溃；内容一致性由前端"启用采样"保证）。
@@ -197,6 +197,7 @@ output/minimax_h3_studio/{node_id}/preview_{sample_fp}.webp
 
 `MiniMaxH3StudioConsole`（CATEGORY=MiniMaxH3，注册键见 `__init__.py` 的 `NODE_CLASS_MAPPINGS`，当前仅此一个注册项）：
 
+- **执行线程**：`async def execute`（异步 V1 节点）。ComfyUI 的 `PromptExecutor.execute` 本身就是 `asyncio.run(...)`（节点图跑在 prompt_worker 线程的事件循环里），所以 `executor.run_async` / `BaseTask.execute` / `run_pipeline_graph` 全部 async、直接 await 官方执行器 `get_output_data`（异步节点的 pending 结果由官方 `execution.py` 收集，不会重跑节点）。**绝不另起线程做 CUDA**：早期版本为了让同步节点能跑异步执行器，在 `_run_async` 里自建 `studio-pipeline` 线程，导致采样/模型加载等 CUDA 工作与 ComfyUI 的模型管理、显存卸载、中断清理分属两个线程 —— 中断时释放张量会让 cudaMallocAsync 报 `CUDA_ERROR_INVALID_VALUE`（`cuMemFreeAsync`）并 **abort 整个进程**。预览编码线程（§9）只做 CPU 的 WebP 编码，不碰 CUDA。
 - widgets：`timeline_data`（隐藏 STRING，前端自动填 `{taskId, payload}`）、seed/steps/cfg/sampler/scheduler/shift_video/shift_audio/unload_models_after、`studio_console_ui`（内嵌面板）。
 - optional inputs：model / video_vae / audio_vae（r2v/v2v/rv2v 需要）/ clip（type=minimax）。缺 model/video_vae/clip 返回占位输出并回显错误。
 - 输出：report(STRING) / images(IMAGE) / audio(AUDIO) / fps(FLOAT) / frame_count(INT)。

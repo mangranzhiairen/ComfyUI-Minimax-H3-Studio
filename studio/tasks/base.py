@@ -129,11 +129,15 @@ class BaseTask(ABC):
 
     # ---------- 模板方法 ----------
 
-    def execute(self, prev_av: Any = None) -> SegmentResult:
+    async def execute(self, prev_av: Any = None) -> SegmentResult:
         """采样本段并返回 AV latent（不解码）。
 
         解码在任务末尾统一进行（采样-解码分离架构，见 executor）。
         prev_av 为上一段采样输出的 AV latent（段间引导用，从磁盘加载）。
+
+        async：采样流程（子图）的内层节点执行要走 ComfyUI 官方执行器（await），
+        而 Studio 节点本身也是 async，所以整条链路都在 ComfyUI 的事件循环线程里，
+        不另起线程做 CUDA（跨线程张量生命周期会让 cudaMallocAsync 在中断时炸进程）。
         """
         self.validate()
         conditioning = self.build_conditioning()
@@ -170,7 +174,7 @@ class BaseTask(ABC):
             grid_fit = install_cond_grid_fit(self.ctx.model)
 
         try:
-            samples = self.sample(positive, latent)
+            samples = await self.sample(positive, latent)
         finally:
             if grid_fit:
                 uninstall_cond_grid_fit()
@@ -197,13 +201,14 @@ class BaseTask(ABC):
 
     # ---------- 基类公共：真实采样链路（官方 MiniMax H3 流程） ----------
 
-    def sample(self, positive, latent: dict) -> dict:
+    async def sample(self, positive, latent: dict) -> dict:
         """采样：挂了采样流程（子图）就走子图，否则走内置官方链。
 
         内置链：SigmaShift → BasicScheduler → Guider → SamplerCustomAdvanced，
-        每步进度经包装 guider.sample 转发 → ctx.progress（前端卡片进度条）。"""
+        每步进度经包装 guider.sample 转发 → ctx.progress（前端卡片进度条）。
+        内置链是同步调用（官方节点类直接调），不需要 await。"""
         if self.segment.pipeline is not None:
-            return self._sample_with_pipeline(positive, latent)
+            return await self._sample_with_pipeline(positive, latent)
 
         from ..sampling import sample_single_stage
 
@@ -223,7 +228,7 @@ class BaseTask(ABC):
             progress=self._ksampler_progress(),
         )
 
-    def _sample_with_pipeline(self, positive, latent: dict) -> dict:
+    async def _sample_with_pipeline(self, positive, latent: dict) -> dict:
         """执行该片段绑定的采样流程（前端摊平图 → 官方零件调度，见 studio/pipeline.py）。
 
         进度/预览：把逐步回调挂到 model 上（OUTER_SAMPLE 包装器，见
@@ -251,7 +256,7 @@ class BaseTask(ABC):
         )
         self._report("sampling", 0.0)
         try:
-            return run_pipeline_graph(
+            return await run_pipeline_graph(
                 pipeline.graph,
                 runtime,
                 prompt_id=f"studio-pipeline-{self.segment.id}",

@@ -228,6 +228,13 @@ class _FakeNode:
 
 
 @unittest.skipUnless(_HAS_COMFY, "需要 ComfyUI 运行时")
+def run_graph_sync(*args, **kwargs):
+    """同步驱动 async 的 run_pipeline_graph（真机里它由 Studio 的 async 节点 await）。"""
+    import asyncio
+
+    return asyncio.run(run_pipeline_graph(*args, **kwargs))
+
+
 class TestExecution(unittest.TestCase):
     def setUp(self):
         import nodes
@@ -284,7 +291,7 @@ class TestExecution(unittest.TestCase):
             },
             ("n2", 0),
         )
-        out = run_pipeline_graph(g, runtime_of(latent=10))
+        out = run_graph_sync(g, runtime_of(latent=10))
         self.assertEqual(out, 30)  # (10 + 5) * 2
 
     def test_real_comfy_nodes(self):
@@ -296,19 +303,19 @@ class TestExecution(unittest.TestCase):
             },
             ("noise", 0),
         )
-        out = run_pipeline_graph(g, runtime_of())
+        out = run_graph_sync(g, runtime_of())
         self.assertTrue(hasattr(out, "generate_noise"), f"NOISE 对象异常：{type(out)}")
 
     def test_unknown_node_type(self):
         g = graph_of({"1": ("NoSuchNodeType_xyz", {})}, ("1", 0))
         with self.assertRaises(PipelineError) as ctx:
-            run_pipeline_graph(g, runtime_of())
+            run_graph_sync(g, runtime_of())
         self.assertIn("NoSuchNodeType_xyz", str(ctx.exception))
 
     def test_output_slot_out_of_range(self):
         g = graph_of({"n1": ("StudioTestSum", {"a": 1, "b": 1})}, ("n1", 3))
         with self.assertRaises(PipelineError) as ctx:
-            run_pipeline_graph(g, runtime_of())
+            run_graph_sync(g, runtime_of())
         self.assertIn("输出槽", str(ctx.exception))
 
     def test_studio_slot_providers_are_lazy(self):
@@ -323,7 +330,7 @@ class TestExecution(unittest.TestCase):
         g = graph_of(
             {"n1": ("StudioTestDouble", {"value": ["__studio__", "latent"]})}, ("n1", 0)
         )
-        self.assertEqual(run_pipeline_graph(g, rt), 14)
+        self.assertEqual(run_graph_sync(g, rt), 14)
         self.assertEqual(called, [])
 
 
