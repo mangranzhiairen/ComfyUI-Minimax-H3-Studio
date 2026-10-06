@@ -422,6 +422,63 @@ def attach_sampler_progress(model, on_step):
 
 _GUARD_INSTALLED = False
 
+# 中断 traceback 的延迟释放状态。中断栈帧持有模型 / clone / latent，当场清 traceback 会
+# 同步析构 CUDA 张量（cuMemFreeAsync 返回 CUDA_ERROR_INVALID_VALUE → terminate → abort）。
+# 所以把中断异常暂存起来，等下一个静止安全点（cleanup_models_gc）再清。
+_DEFERRED_INTERRUPT_EXC: list[BaseException] = []
+_DEFERRED_DRAINING = False
+
+
+def defer_interrupt_traceback_release(exc: BaseException) -> None:
+    """暂存中断异常，等安全排空点再释放其 traceback（绝不在中断现场清）。"""
+    try:
+        _DEFERRED_INTERRUPT_EXC.append(exc)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def release_deferred_interrupt_tracebacks() -> None:
+    """在静止安全点释放暂存中断异常的 traceback。
+
+    ComfyUI 的 cleanup_models_gc() 在每个 prompt 起点（execution.py:769）与模型加载时调用，
+    那里不在 unwind 的采样栈上、CUDA 上下文可用，此时清 traceback 安全；随后它的
+    gc.collect() 回收模型，weakref.finalize 触发的 cleanup_models() 清掉 dead 记录，
+    memory leak 警告随之消失。可重入保护避免 gc 回调里再次触发放大。
+    """
+    global _DEFERRED_DRAINING
+    if _DEFERRED_DRAINING or not _DEFERRED_INTERRUPT_EXC:
+        return
+    _DEFERRED_DRAINING = True
+    try:
+        while _DEFERRED_INTERRUPT_EXC:
+            exc = _DEFERRED_INTERRUPT_EXC.pop()
+            for attr in ("__traceback__", "__context__", "__cause__"):
+                try:
+                    setattr(exc, attr, None)
+                except Exception:  # noqa: BLE001
+                    pass
+    finally:
+        _DEFERRED_DRAINING = False
+
+
+def _install_cleanup_models_gc_hook() -> None:
+    """让 ComfyUI 的 cleanup_models_gc() 每次运行前先排空暂存的中断 traceback（幂等）。"""
+    try:
+        import comfy.model_management as mm
+
+        orig = getattr(mm, 'cleanup_models_gc', None)
+        if orig is None or getattr(orig, '_studio_deferred_traceback', False):
+            return
+
+        def cleanup_models_gc():
+            release_deferred_interrupt_tracebacks()
+            return orig()
+
+        cleanup_models_gc._studio_deferred_traceback = True  # type: ignore[attr-defined]
+        mm.cleanup_models_gc = cleanup_models_gc  # type: ignore[assignment]
+    except Exception:  # noqa: BLE001
+        log.debug("安装中断 traceback 延迟释放钩子失败", exc_info=True)
+
 
 def install_sampling_interrupt_guards() -> None:
     """给 CFGGuider.outer_sample 补一层「异常也清理」的护罩（幂等）。
@@ -437,6 +494,7 @@ def install_sampling_interrupt_guards() -> None:
     memory leak with model 警告的来源。这里只在异常路径补做同等清理（正常返回不受影响）。
     """
     global _GUARD_INSTALLED
+    _install_cleanup_models_gc_hook()
     if _GUARD_INSTALLED:
         return
     try:
@@ -481,6 +539,20 @@ def install_sampling_interrupt_guards() -> None:
         return
     _GUARD_INSTALLED = True
     log.debug("已安装采样中断清理护罩（CFGGuider.outer_sample）")
+
+
+def is_interrupt(exc: BaseException) -> bool:
+    """中断异常判定。
+
+    ComfyUI 的 InterruptProcessingException 继承 BaseException（不是 Exception），
+    节点层 except Exception 拦不住它，必须单独识别（否则会被当成普通失败吞掉）。
+    """
+    try:
+        import comfy.model_management as mm
+
+        return isinstance(exc, mm.InterruptProcessingException)
+    except Exception:  # noqa: BLE001 无 ComfyUI 环境（测试）按非中断处理
+        return False
 
 
 def cleanup_after_interrupt() -> None:

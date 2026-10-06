@@ -174,32 +174,42 @@ class MiniMaxH3StudioConsole:
 
         except BaseException as exc:  # noqa: BLE001 中断是 BaseException：清理后原样抛出，绝不吞
             _cleanup_interrupted(exc)
+            # 松开本帧对整条依赖链的强引用（模型/VAE/CLIP），减少中断栈的驻留；
+            # 但**不动** exc.__traceback__（原因见 _cleanup_interrupted 注释）。
+            executor = deps = model = video_vae = audio_vae = clip = None
             raise
 
         return report, images, audio, fps, frame_count
 
 
 def _cleanup_interrupted(exc) -> None:
-    """中断收尾：补做被跳过的清理，并丢弃采样栈。
+    """中断收尾：补做 ComfyUI 中断路径会跳过的全局清理。
 
-    采样栈对「中断」没有诊断价值，却会长期持有整条链上的模型 / clone / latent；
-    guider 与全局目标状态由 cleanup_after_interrupt() 处理。
+    guider / 模块级 prefetch / cast buffer / 显存回收由 cleanup_after_interrupt() 处理。
+
+    ⚠️ 这里**绝不**当场清空 exc.__traceback__。中断栈里的帧持有整条链上的模型 / clone /
+    latent，在 unwind 过程中同步销毁它们，会让 cudaMallocAsync 的 cuMemFreeAsync 返回
+    CUDA_ERROR_INVALID_VALUE（torch CUDAMallocAsyncAllocator::free_impl 抛
+    c10::AcceleratorError → terminate → 整个进程 abort，Python 层 try/except 拦不住）。
+    旧实现正是用 exc.__traceback__ = None「顺手释放采样栈」，结果一中断就崩进程。
+
+    采样栈改为**延迟释放**：cleanup_after_interrupt() 跑完后再把异常交给
+    defer_interrupt_traceback_release() 暂存，等下一个 prompt 起点 ComfyUI 调
+    cleanup_models_gc() 时（execution.py:769，静止安全点）才真正清 traceback。
+    guider 抱死 inner_model 的问题则由 install_sampling_interrupt_guards() 的异常护罩处理。
     """
     try:
-        import comfy.model_management as mm
+        from ..studio.sampling import (
+            cleanup_after_interrupt,
+            defer_interrupt_traceback_release,
+            is_interrupt,
+        )
 
-        if not isinstance(exc, mm.InterruptProcessingException):
+        if not is_interrupt(exc):
             return
-    except Exception:  # noqa: BLE001
-        return
-    try:
-        exc.__traceback__ = None
-    except Exception:  # noqa: BLE001
-        pass
-    try:
-        from ..studio.sampling import cleanup_after_interrupt
-
         cleanup_after_interrupt()
+        # 顺序关键：cleanup 期间列表必须为空，defer 放最后，避免在 unwind 中被被动排空
+        defer_interrupt_traceback_release(exc)
     except Exception:  # noqa: BLE001
         log.debug("中断清理失败", exc_info=True)
 

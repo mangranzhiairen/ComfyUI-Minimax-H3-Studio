@@ -1165,6 +1165,8 @@ class InterruptCleanupTest(unittest.TestCase):
             else:
                 sys.modules[name] = mod
         self.sampling._GUARD_INSTALLED = False
+        self.sampling._DEFERRED_INTERRUPT_EXC.clear()
+        self.sampling._DEFERRED_DRAINING = False
 
     def _install_fakes(self):
         import types
@@ -1184,8 +1186,13 @@ class InterruptCleanupTest(unittest.TestCase):
         samplers.CFGGuider = FakeGuider
         helpers.cleanup_models = lambda conds, models: calls.append(("cleanup_models", conds, models))
         mm.cleanup_models = lambda: calls.append(("cleanup_models_gc",))
+        mm.cleanup_models_gc = lambda: calls.append(("cleanup_models_gc",))
         mm.soft_empty_cache = lambda: calls.append(("soft_empty_cache",))
         mm.reset_cast_buffers = lambda: calls.append(("reset_cast_buffers",))
+        # 真实类：comfy/model_management.py:2098 InterruptProcessingException(BaseException)
+        mm.InterruptProcessingException = type(
+            "InterruptProcessingException", (BaseException,), {})
+        self.interrupt_cls = mm.InterruptProcessingException
         cmm.aimdo_enabled = True
         prefetch.cleanup_prefetch_queues = lambda: calls.append(("prefetch",))
 
@@ -1233,6 +1240,61 @@ class InterruptCleanupTest(unittest.TestCase):
         self.assertIn("reset_cast_buffers", names)
         self.assertIn("cleanup_models_gc", names)
         self.assertIn("soft_empty_cache", names)
+
+    def test_is_interrupt_matches_interrupt_exception(self):
+        """中断异常是 BaseException 子类：必须被认出来，否则清理不跑。"""
+        self.assertTrue(self.sampling.is_interrupt(self.interrupt_cls("x")))
+        self.assertFalse(self.sampling.is_interrupt(RuntimeError("x")))
+
+    def test_node_cleanup_never_clears_traceback(self):
+        """回归：清 traceback 会同步析构采样栈里的 CUDA 张量 → CUDA_ERROR_INVALID_VALUE → abort。"""
+        here = Path(__file__).resolve().parent
+        src = (here.parent / "nodes" / "studio_console.py").read_text(encoding="utf-8")
+        # 允许文档/注释里解释该写法，但绝不允许它作为语句出现
+        offenders = [ln for ln in src.splitlines() if ln.strip() == "exc.__traceback__ = None"]
+        self.assertEqual(offenders, [], "节点又清了中断 traceback，会同步析构 CUDA 张量导致 abort")
+
+    def test_deferred_traceback_release_clears_attrs(self):
+        """延迟释放：安全排空点清掉 traceback/context/cause，中断现场则只暂存。"""
+        try:
+            try:
+                raise ValueError("inner")
+            except ValueError as inner:
+                raise RuntimeError("outer") from inner
+        except RuntimeError as exc:
+            self.assertIsNotNone(exc.__traceback__)
+            self.sampling.defer_interrupt_traceback_release(exc)
+            self.assertIn(exc, self.sampling._DEFERRED_INTERRUPT_EXC)
+            self.sampling.release_deferred_interrupt_tracebacks()
+            self.assertIsNone(exc.__traceback__)
+            self.assertIsNone(exc.__context__)
+            self.assertIsNone(exc.__cause__)
+            self.assertEqual(self.sampling._DEFERRED_INTERRUPT_EXC, [])
+
+    def test_cleanup_models_gc_hook_drains_before_original(self):
+        """patch 后 cleanup_models_gc 先排空暂存 traceback，再调原函数。"""
+        self.sampling._GUARD_INSTALLED = False
+        self.sampling.install_sampling_interrupt_guards()
+        mm = sys.modules["comfy.model_management"]
+        hook = mm.cleanup_models_gc
+        self.assertTrue(getattr(hook, "_studio_deferred_traceback", False))
+        caught = None
+        try:
+            raise ValueError("x")
+        except ValueError as exc:
+            caught = exc
+        self.assertIsNotNone(caught.__traceback__)
+        self.sampling.defer_interrupt_traceback_release(caught)
+        hook()
+        self.assertIsNone(caught.__traceback__)
+        self.assertIn(("cleanup_models_gc",), self.calls)
+
+    def test_cleanup_models_gc_hook_is_idempotent(self):
+        self.sampling._install_cleanup_models_gc_hook()
+        mm = sys.modules["comfy.model_management"]
+        first = mm.cleanup_models_gc
+        self.sampling._install_cleanup_models_gc_hook()
+        self.assertIs(mm.cleanup_models_gc, first)
 
 
 if __name__ == "__main__":
