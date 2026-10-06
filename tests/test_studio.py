@@ -237,6 +237,182 @@ class MotionContextGridTest(unittest.TestCase):
         self.assertEqual(snap_context_frames(20), 22)
 
 
+class ContextConformTest(unittest.TestCase):
+    """通用 context 空间整形：任意来源分辨率 → 目标网格（时间轴/音频不动）。"""
+
+    def setUp(self):
+        import types
+
+        if "node_helpers" not in sys.modules:  # 纯函数测试环境没有 ComfyUI 根目录
+            stub = types.ModuleType("node_helpers")
+
+            def conditioning_set_values(cond, values, append=False):
+                out = []
+                for emb, d in cond:
+                    d = dict(d)
+                    for k, v in values.items():
+                        d[k] = list(d.get(k) or []) + list(v) if append else v
+                    out.append([emb, d])
+                return out
+
+            stub.conditioning_set_values = conditioning_set_values
+            sys.modules["node_helpers"] = stub
+
+    @staticmethod
+    def _nested(video, audio):
+        class FakeNested:
+            def __init__(self, tensors):
+                self.tensors = list(tensors)
+                self.is_nested = True
+
+            def unbind(self):
+                return self.tensors
+
+        return FakeNested((video, audio))
+
+    def _latent(self, t=12, h=6, w=8, audio_t=40):
+        import torch
+
+        video = torch.arange(t * h * w, dtype=torch.float32).reshape(1, 1, t, h, w)
+        video = video.expand(1, 24, t, h, w).contiguous()
+        audio = torch.zeros(1, 32, 2, audio_t)
+        return {"samples": self._nested(video, audio)}
+
+    def test_resize_video_latent_spatial_only_and_mean_preserving(self):
+        import torch
+
+        from studio.context_conform import resize_video_latent
+
+        src = self._latent(12, 6, 8)["samples"].tensors[0]
+        out = resize_video_latent(src, 3, 4)
+        self.assertEqual(tuple(out.shape), (1, 24, 12, 3, 4))
+        # 时间轴不动：逐帧插值，没有跨时间混合（相邻帧内容仍不同）
+        for t in range(12):
+            self.assertFalse(torch.equal(out[0, 0, t], out[0, 0, (t + 1) % 12]))
+        # 均值保持：每帧/每通道缩放后均值 = 源均值
+        src_mean = src.float().mean(dim=(-2, -1))
+        out_mean = out.float().mean(dim=(-2, -1))
+        self.assertTrue(torch.allclose(src_mean, out_mean, atol=1e-5))
+
+    def test_conform_is_noop_when_matching(self):
+        from studio.context_conform import conform_context_latent, video_hw
+
+        latent = self._latent(12, 6, 8)
+        self.assertIs(conform_context_latent(latent, target_video_hw=(6, 8)), latent)
+        self.assertEqual(video_hw(latent), (6, 8))
+
+    def test_conform_preserves_audio_and_metadata(self):
+        import torch
+
+        from studio.context_conform import conform_context_latent
+
+        latent = self._latent(12, 6, 8)
+        latent["foo"] = 7
+        audio_before = latent["samples"].tensors[1].clone()
+        out = conform_context_latent(latent, target_video_hw=(3, 4))
+        self.assertEqual(out["foo"], 7)
+        self.assertEqual(tuple(out["samples"].unbind()[0].shape), (1, 24, 12, 3, 4))
+        self.assertTrue(torch.equal(out["samples"].unbind()[1], audio_before))
+        # 输入不被就地改写
+        self.assertEqual(tuple(latent["samples"].tensors[0].shape), (1, 24, 12, 6, 8))
+
+    def test_conform_resizes_noise_mask_video_stream(self):
+        import torch
+
+        from studio.context_conform import conform_context_latent
+
+        latent = self._latent(12, 6, 8)
+        latent["noise_mask"] = self._nested(
+            torch.ones(1, 1, 12, 6, 8), torch.ones(1, 1, 1, 40)
+        )
+        out = conform_context_latent(latent, target_video_hw=(3, 4))
+        mask = out["noise_mask"].unbind()
+        self.assertEqual(tuple(mask[0].shape), (1, 1, 12, 3, 4))
+        self.assertEqual(tuple(mask[1].shape), (1, 1, 1, 40))
+
+    def test_conform_image_latent_4d(self):
+        import torch
+
+        from studio.context_conform import conform_context_latent
+
+        image = torch.arange(4 * 6 * 8, dtype=torch.float32).reshape(1, 4, 6, 8)
+        out = conform_context_latent({"samples": image}, target_video_hw=(3, 4))
+        self.assertEqual(tuple(out["samples"].shape), (1, 4, 3, 4))
+
+    def test_resize_rejects_unknown_mode(self):
+        from studio.context_conform import resize_video_latent
+
+        with self.assertRaises(ValueError):
+            resize_video_latent(self._latent(12, 6, 8)["samples"].tensors[0], 3, 4, mode="bogus")
+
+    def test_motion_context_auto_conforms_mismatched_canvas(self):
+        """画布不一致时自动缩放 context 视频流，而不是报错。"""
+        import torch
+
+        from studio.motion_context import apply_motion_context
+
+        # 当前段：高 6 / 宽 8 latent；上一段：高 12 / 宽 16（放大后的网格）
+        def av(t, h, w, audio_t):
+            return {
+                "samples": self._nested(
+                    torch.zeros(1, 24, t, h, w), torch.zeros(1, 32, 2, audio_t)
+                )
+            }
+
+        latent = av(37, 6, 8, 207)  # 37 步 = 124 帧
+        context = av(7, 12, 16, 40)  # 7 步 = 22 帧，且是放大后的网格
+        out, trim = apply_motion_context([[None, {}]], latent, context, 22)
+        self.assertEqual(trim, 22)
+        kfs = out[0][1]["minimax_keyframes"]
+        video_kfs = [k for k in kfs if "latent" in k]
+        self.assertEqual(len(video_kfs), 7)
+        # 钉入块已整形到目标网格
+        self.assertEqual(tuple(video_kfs[0]["latent"].shape)[-2:], (6, 8))
+
+    def test_motion_context_matching_canvas_skips_scaling(self):
+        """前后画布一致时自动判定为「无需整形」：钉入块就是上一段尾部的原样切片。"""
+        import torch
+
+        from studio.motion_context import apply_motion_context
+
+        def av(t, h, w, audio_t):
+            video = (
+                torch.arange(t * h * w, dtype=torch.float32)
+                .reshape(1, 1, t, h, w)
+                .expand(1, 24, t, h, w)
+                .contiguous()
+            )
+            return {"samples": self._nested(video, torch.zeros(1, 32, 2, audio_t))}
+
+        latent = av(37, 6, 8, 207)
+        context = av(7, 6, 8, 40)  # 与本节同网格
+        src_video = context["samples"].tensors[0]
+        out, trim = apply_motion_context([[None, {}]], latent, context, 22)
+        self.assertEqual(trim, 22)
+        blocks = [k["latent"] for k in out[0][1]["minimax_keyframes"] if "latent" in k]
+        self.assertEqual(len(blocks), 7)
+        # 逐块等于上一段对应步的原样切片（没有被插值）
+        for i, blk in enumerate(blocks):
+            self.assertTrue(torch.equal(blk, src_video[:, :, i : i + 1]))
+
+    def test_motion_context_strict_mode_still_raises(self):
+        import torch
+
+        from studio.motion_context import apply_motion_context
+
+        def av(t, h, w):
+            return {
+                "samples": self._nested(
+                    torch.zeros(1, 24, t, h, w), torch.zeros(1, 32, 2, 40)
+                )
+            }
+
+        with self.assertRaises(ValueError):
+            apply_motion_context(
+                [[None, {}]], av(7, 6, 8), av(7, 12, 16), 22, conform=False
+            )
+
+
 class SegmentCacheUtilTest(unittest.TestCase):
     def test_fingerprint_stable_and_sensitive(self):
         """两级指纹：内容指纹（纯画面语义）稳定；采样指纹（latent）对工艺敏感；

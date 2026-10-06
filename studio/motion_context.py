@@ -151,8 +151,15 @@ def apply_motion_context(
     context_latent: dict,
     context_length: int,
     audio_context_length: int | None = None,
+    conform: bool = True,
 ) -> tuple[list, int]:
-    """把上一段 latent 尾部钉入当前 conditioning，返回 (positive, trim_frames)。"""
+    """把上一段 latent 尾部钉入当前 conditioning，返回 (positive, trim_frames)。
+
+    自动检测：上一段 latent 与本节目标网格一致时零拷贝直通、不做任何整形；不一致时
+    （例如上一段走二采/放大后是 1.0 网格，本段低清阶段是 0.4 目标网格）自动做通用
+    context 空间整形，只缩视频流，音频/时间轴不动（见 context_conform）。
+    conform=False 仅供排查时强制严格报错。
+    """
     import node_helpers
 
     ctx_frames = snap_context_frames(context_length)
@@ -162,12 +169,40 @@ def apply_motion_context(
     height = int(video.shape[3]) * 16
     frame_count = pixel_frames_for_latent_t(int(video.shape[2]))
 
+    # 自动检测：前后画布不一致才整形。一致时提前判掉，省一次拆/装流的开销，
+    # 也避免对本来匹配的 context 做无意义的插值（conform_context_latent 本身
+    # 匹配时零拷贝返回，这里是显式的提前判定 + 日志）。
     src = video_from_latent(context_latent)
     src_w, src_h = int(src.shape[4]) * 16, int(src.shape[3]) * 16
     if (src_w, src_h) != (width, height):
+        if not conform:
+            raise ValueError(
+                f"段间引导: 上一段 latent 是 {src_w}x{src_h}，当前段是 {width}x{height}；"
+                "conform=False（排查用）时拒绝缩放，请保证各段画布一致"
+            )
+        old_w, old_h = src_w, src_h
+        # 例：上一段走二采/放大后是 1.0 网格，本段低清阶段是 0.4 目标网格。
+        # 只对视频流做空间整形，音频与时间轴不动（见 context_conform）。
+        from .context_conform import conform_context_latent
+
+        context_latent = conform_context_latent(context_latent, target_latent=latent)
+        src = video_from_latent(context_latent)
+        src_w, src_h = int(src.shape[4]) * 16, int(src.shape[3]) * 16
+        if (src_w, src_h) != (width, height):
+            raise ValueError(
+                f"段间引导: context 整形后仍是 {src_w}x{src_h}，当前段 {width}x{height}；"
+                "context_conform 未能对齐目标网格"
+            )
+        log.info(
+            "段间引导: 自动检测到画布不一致，context 视频流 %dx%d → %dx%d（音频/时间轴不动）",
+            old_w, old_h, width, height,
+        )
+    else:
+        log.debug("段间引导: 前后画布一致（%dx%d），不做空间整形", width, height)
+    if int(src.shape[1]) != int(video.shape[1]):
         raise ValueError(
-            f"段间引导: 上一段 latent 是 {src_w}x{src_h}，当前段是 {width}x{height}；"
-            "latent 无法缩放，请保证各段画布一致"
+            f"段间引导: 上一段 latent 有 {int(src.shape[1])} 个通道，当前段有 "
+            f"{int(video.shape[1])} 个；这不是同一模型产出的 H3 视频 latent"
         )
 
     available = pixel_frames_for_latent_t(int(src.shape[2]))

@@ -17,6 +17,7 @@ studio/
 │                           #          base.py 模板方法 + t2v/i2v/fl2v/r2v/v2v/rv2v 六子类
 ├── sampling.py             # 官方 MiniMax H3 真实采样链路（conditioning → KSampler → 解码）
 ├── motion_context.py       # 段间引导：上一段 latent 尾部钉入 + 相位网格
+├── context_conform.py      # 通用 context 空间整形：异画布时把上一段视频 latent 缩到目标网格
 ├── segment_cache.py        # SQLite 任务库 + latent/preview 文件 + 两级指纹
 ├── media_loader.py         # 素材（图/视频/音频）加载为 tensor / AUDIO dict
 ├── tae_preview.py          # TAE（tiny VAE）采样预览：live + final 动画 WebP
@@ -120,6 +121,7 @@ Motion Context **latent 直接传递**方案（不 VAE 解码）：
 - 模型像素网格：`FRAME_PER_TOKEN = (1,4,4,4,4)`（5 步周期）；帧数 = `17k+5`。像素帧 ↔ latent step 换算见 `pixel_frames_for_latent_t / steps_for_frames / step_offsets`。
 - 上下文长度可选窗口：5/22/39/56 帧（`CONTEXT_FRAME_CHOICES`），默认 22；`generation_frame_budget(visible, context)` 计算采样总长（= align(visible+ctx)）与要裁的 ctx。
 - `apply_motion_context(positive, latent, prev_av, ctx)`：从上一段 latent **尾部按整步切块**（相位断言：tail 起点必须在 5 周期位置 0，否则拒绝错位 join）→ 构造 `minimax_keyframes`（resolved_frame_index 按步真实偏移）→ 与 conditioning 已有非 0 锚（如 fl2v 尾帧）合并 → 音频同样从上一段 latent 尾部切出作为 `minimax_refs` 音频 → 返回新 positive + trim 帧数。
+- **异画布自动整形**（见 `context_conform.py`）：钉入前自动检测上一段 latent 与本节目标网格——一致时零拷贝直通、不做任何插值；不一致时（典型是上一段走了二采/放大，产出 1.0 网格，而本节低清阶段是 0.4 网格）对上一段视频流做空间插值（缩小 area / 放大 bilinear，逐帧、`preserve_mean` 修插值色偏），**时间轴与音频流不动**，然后再切块钉入。`apply_motion_context(..., conform=False)` 仅供排查时强制严格报错。
 - `trim_context_prefix(images, audio, trim)`：解码后同步裁掉画面前缀与音频前导（按 fps/sr 换算采样点）。
 
 ## 7. 数据层（segment_cache.py）
