@@ -1057,5 +1057,103 @@ class OfficialNodeCallTest(unittest.TestCase):
         self.assertIn("FakeRefToVideo.execute 不接受参数", str(cm.exception))
 
 
+class InterruptCleanupTest(unittest.TestCase):
+    """中断清理：补做 ComfyUI 中断路径会跳过的收尾（防止 guider 抱死真实模型）。"""
+
+    def setUp(self):
+        import studio.sampling as sampling
+
+        self.sampling = sampling
+        self.calls: list = []
+        self._saved = {
+            name: sys.modules.get(name)
+            for name in (
+                "comfy",
+                "comfy.samplers",
+                "comfy.sampler_helpers",
+                "comfy.model_management",
+                "comfy.memory_management",
+                "comfy.model_prefetch",
+            )
+        }
+        self._install_fakes()
+
+    def tearDown(self):
+        for name, mod in self._saved.items():
+            if mod is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = mod
+        self.sampling._GUARD_INSTALLED = False
+
+    def _install_fakes(self):
+        import types
+
+        comfy = types.ModuleType("comfy")
+        samplers = types.ModuleType("comfy.samplers")
+        helpers = types.ModuleType("comfy.sampler_helpers")
+        mm = types.ModuleType("comfy.model_management")
+        cmm = types.ModuleType("comfy.memory_management")
+        prefetch = types.ModuleType("comfy.model_prefetch")
+        calls = self.calls
+
+        class FakeGuider:
+            def outer_sample(self, *args, **kwargs):
+                raise RuntimeError("interrupted")
+
+        samplers.CFGGuider = FakeGuider
+        helpers.cleanup_models = lambda conds, models: calls.append(("cleanup_models", conds, models))
+        mm.cleanup_models = lambda: calls.append(("cleanup_models_gc",))
+        mm.soft_empty_cache = lambda: calls.append(("soft_empty_cache",))
+        mm.reset_cast_buffers = lambda: calls.append(("reset_cast_buffers",))
+        cmm.aimdo_enabled = True
+        prefetch.cleanup_prefetch_queues = lambda: calls.append(("prefetch",))
+
+        comfy.samplers = samplers
+        comfy.sampler_helpers = helpers
+        comfy.model_management = mm
+        comfy.memory_management = cmm
+        comfy.model_prefetch = prefetch
+        for name, mod in (
+            ("comfy", comfy),
+            ("comfy.samplers", samplers),
+            ("comfy.sampler_helpers", helpers),
+            ("comfy.model_management", mm),
+            ("comfy.memory_management", cmm),
+            ("comfy.model_prefetch", prefetch),
+        ):
+            sys.modules[name] = mod
+        self.guider_cls = FakeGuider
+
+    def test_guard_cleans_guider_on_exception(self):
+        self.sampling._GUARD_INSTALLED = False
+        self.sampling.install_sampling_interrupt_guards()
+        guider = self.guider_cls()
+        guider.conds = {"positive": []}
+        guider.loaded_models = ["m"]
+        guider.inner_model = "real"
+        with self.assertRaises(RuntimeError):
+            guider.outer_sample()
+        self.assertFalse(hasattr(guider, "inner_model"))
+        self.assertFalse(hasattr(guider, "loaded_models"))
+        self.assertFalse(hasattr(guider, "conds"))
+        self.assertIn(("cleanup_models", {"positive": []}, ["m"]), self.calls)
+
+    def test_install_is_idempotent(self):
+        self.sampling._GUARD_INSTALLED = False
+        self.sampling.install_sampling_interrupt_guards()
+        first = self.guider_cls.outer_sample
+        self.sampling.install_sampling_interrupt_guards()
+        self.assertIs(self.guider_cls.outer_sample, first)
+
+    def test_cleanup_after_interrupt_calls_global_cleanups(self):
+        self.sampling.cleanup_after_interrupt()
+        names = [call[0] for call in self.calls]
+        self.assertIn("prefetch", names)
+        self.assertIn("reset_cast_buffers", names)
+        self.assertIn("cleanup_models_gc", names)
+        self.assertIn("soft_empty_cache", names)
+
+
 if __name__ == "__main__":
     unittest.main(argv=[sys.argv[0]])

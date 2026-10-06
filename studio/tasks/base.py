@@ -207,6 +207,10 @@ class BaseTask(ABC):
         内置链：SigmaShift → BasicScheduler → Guider → SamplerCustomAdvanced，
         每步进度经包装 guider.sample 转发 → ctx.progress（前端卡片进度条）。
         内置链是同步调用（官方节点类直接调），不需要 await。"""
+        from ..sampling import install_sampling_interrupt_guards
+
+        # 补上 ComfyUI 中断路径会跳过的收尾（否则 guider 会一直抱着真实模型 → 泄漏警告）
+        install_sampling_interrupt_guards()
         if self.segment.pipeline is not None:
             return await self._sample_with_pipeline(positive, latent)
 

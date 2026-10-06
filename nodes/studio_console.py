@@ -172,7 +172,36 @@ class MiniMaxH3StudioConsole:
             audio = _placeholder_audio()
             fps, frame_count = 24.0, 0
 
+        except BaseException as exc:  # noqa: BLE001 中断是 BaseException：清理后原样抛出，绝不吞
+            _cleanup_interrupted(exc)
+            raise
+
         return report, images, audio, fps, frame_count
+
+
+def _cleanup_interrupted(exc) -> None:
+    """中断收尾：补做被跳过的清理，并丢弃采样栈。
+
+    采样栈对「中断」没有诊断价值，却会长期持有整条链上的模型 / clone / latent；
+    guider 与全局目标状态由 cleanup_after_interrupt() 处理。
+    """
+    try:
+        import comfy.model_management as mm
+
+        if not isinstance(exc, mm.InterruptProcessingException):
+            return
+    except Exception:  # noqa: BLE001
+        return
+    try:
+        exc.__traceback__ = None
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from ..studio.sampling import cleanup_after_interrupt
+
+        cleanup_after_interrupt()
+    except Exception:  # noqa: BLE001
+        log.debug("中断清理失败", exc_info=True)
 
 
 def _placeholder_image(height: int, width: int):

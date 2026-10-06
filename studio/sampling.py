@@ -418,6 +418,116 @@ def attach_sampler_progress(model, on_step):
         return model
 
 
+# ---------- 中断清理（ComfyUI 官方路径在中断时会被跳过的收尾） ----------
+
+_GUARD_INSTALLED = False
+
+
+def install_sampling_interrupt_guards() -> None:
+    """给 CFGGuider.outer_sample 补一层「异常也清理」的护罩（幂等）。
+
+    官方 outer_sample() 的收尾写在函数末尾、**不在 finally 里**：
+
+    - comfy.sampler_helpers.cleanup_models(self.conds, self.loaded_models)
+    - del self.inner_model / del self.loaded_models
+
+    采样循环里抛 InterruptProcessingException（中断）时会直接跳过这几行，于是 guider 一直
+    抱着 inner_model（真实 BaseModel）/ loaded_models / conds。guider 是 BasicGuider 节点的
+    缓存输出、会跨 prompt 存活，被抱住的模型就永远回收不了 —— 这正是中断后
+    memory leak with model 警告的来源。这里只在异常路径补做同等清理（正常返回不受影响）。
+    """
+    global _GUARD_INSTALLED
+    if _GUARD_INSTALLED:
+        return
+    try:
+        import comfy.sampler_helpers as _sh
+        import comfy.samplers as _cs
+    except Exception:  # noqa: BLE001 非采样环境（测试）直接跳过
+        return
+
+    orig = getattr(_cs.CFGGuider, 'outer_sample', None)
+    if orig is None:
+        _GUARD_INSTALLED = True
+        return
+    if getattr(orig, '_studio_interrupt_cleanup', False):
+        _GUARD_INSTALLED = True
+        return
+
+    def outer_sample(self, *args, **kwargs):
+        try:
+            return orig(self, *args, **kwargs)
+        except BaseException:
+            # 官方只在正常返回时清理；异常（尤其中断）时由我们补上
+            try:
+                _sh.cleanup_models(
+                    getattr(self, 'conds', None) or {},
+                    getattr(self, 'loaded_models', None) or [],
+                )
+            except Exception:  # noqa: BLE001
+                log.debug("中断清理: 采样附加模型清理失败", exc_info=True)
+            for name in ('inner_model', 'loaded_models', 'conds'):
+                if hasattr(self, name):
+                    try:
+                        delattr(self, name)
+                    except Exception:  # noqa: BLE001
+                        pass
+            raise
+
+    outer_sample._studio_interrupt_cleanup = True  # type: ignore[attr-defined]
+    outer_sample._studio_orig = orig  # type: ignore[attr-defined]
+    try:
+        _cs.CFGGuider.outer_sample = outer_sample  # type: ignore[assignment]
+    except Exception:  # noqa: BLE001
+        return
+    _GUARD_INSTALLED = True
+    log.debug("已安装采样中断清理护罩（CFGGuider.outer_sample）")
+
+
+def cleanup_after_interrupt() -> None:
+    """中断后补做 ComfyUI 正常路径会做、但中断 / 异步节点路径跳过的全局清理。
+
+    只做清理不做业务：任何一步失败都静默降级。
+    """
+    # 1) 模型前向在模块级全局留下的 prefetch 队列 / CUDA graph（执行器 per-node finally 的活）
+    try:
+        import comfy.model_prefetch
+
+        comfy.model_prefetch.cleanup_prefetch_queues()
+    except Exception:  # noqa: BLE001
+        log.debug("中断清理: prefetch queue 清理失败", exc_info=True)
+
+    # 2) aimdo 的 cast buffer / vbar watermark（与执行器 finally 一致）
+    try:
+        import comfy.memory_management as cmm
+        import comfy.model_management as mm
+
+        if getattr(cmm, 'aimdo_enabled', False):
+            mm.reset_cast_buffers()
+            try:
+                import comfy_aimdo.model_vbar
+
+                comfy_aimdo.model_vbar.vbars_reset_watermark_limits()
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception:  # noqa: BLE001
+        log.debug("中断清理: aimdo 缓存重置失败", exc_info=True)
+
+    # 3) 先回收没人引用的模型，再让 ComfyUI 删掉对应的 dead 记录（true leak 只能靠这步清）
+    try:
+        import gc
+
+        gc.collect()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        import comfy.model_management as mm
+
+        mm.cleanup_models()
+        mm.soft_empty_cache()
+    except Exception:  # noqa: BLE001
+        log.debug("中断清理: 显存回收失败", exc_info=True)
+
+
 def empty_audio_dict() -> dict[str, Any]:
     """静音/无音频输出占位（ComfyUI AUDIO 结构）。"""
     return {
