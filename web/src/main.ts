@@ -188,6 +188,46 @@ export function createStudioConsole(): StudioConsoleApi {
   };
 }
 
+/**
+ * 临时兼容 ComfyUI Frontend #12443（#11574 引入的回归）：
+ * LiteGraph 模式下 WidgetLegacy.vue 每次 draw 都把容器 clientWidth 无条件写进
+ * `widget.width`；而画布用 `widget.width || nodeWidth`、DOM 覆盖层用
+ * `widget.width ?? nodeWidth` 回退——一旦该值成了数字，widget 宽度就与
+ * `node.size[0]` 脱钩（本工作台表现为时间线面板缩在节点左侧，添加片段后定型，
+ * 刷新才恢复）。这里给本节点的 widget 装一个 width 守卫：
+ * - LiteGraph 模式（LiteGraph.vueNodesMode 非 true）：丢弃外部写入并保持
+ *   undefined（不能是 0：DomWidgets.vue 用 `??`，0 不会回退）。
+ * - Vue 节点模式：不干预，写透。
+ * 上游修复（正确的一行改在 WidgetLegacy.vue）落地后，本守卫自动变成空操作。
+ */
+interface WidthGuardWidget {
+  width?: number;
+  __stWidth?: number;
+  __stWidthGuarded?: boolean;
+}
+function guardLegacyWidgetWidth(widget: unknown): void {
+  const w = widget as WidthGuardWidget | null | undefined;
+  if (!w || typeof w !== "object" || w.__stWidthGuarded) return;
+  try {
+    Object.defineProperty(w, "width", {
+      configurable: true,
+      enumerable: true,
+      get(this: WidthGuardWidget): number | undefined {
+        return this.__stWidth;
+      },
+      set(this: WidthGuardWidget, value: number | undefined): void {
+        const lg = (globalThis as { LiteGraph?: { vueNodesMode?: boolean } }).LiteGraph;
+        // Vue 节点模式下写入是合法的（节点自身布局）；LiteGraph 模式下必须丢弃
+        this.__stWidth = lg?.vueNodesMode ? value : undefined;
+      },
+    });
+    w.__stWidth = undefined; // 清掉可能已被污染的值
+    w.__stWidthGuarded = true;
+  } catch {
+    // 个别 widget 若不可扩展则跳过，不影响其余 widget
+  }
+}
+
 // ---------- 创意工作台 widget 创建（照官方 Vue 示例） ----------
 
 function createVueWidget(node: ComfyLGraphNode) {
@@ -207,6 +247,8 @@ function createVueWidget(node: ComfyLGraphNode) {
     getValue: () => "",
     setValue: () => {},
   });
+  // 临时兼容 #12443：LiteGraph 模式下 widget.width 会与 node.size[0] 脱钩
+  guardLegacyWidgetWidth(widget);
   // 占位值：保证 required 输入在 prompt 中始终有值（后端 **kwargs 忽略）
   widget.value = "";
 
@@ -249,6 +291,9 @@ app.registerExtension({
     if (node.constructor?.comfyClass !== NODE_CLASS) return;
     const [oldWidth, oldHeight] = node.size;
     node.setSize([Math.max(oldWidth, 620), Math.max(oldHeight, 640)]);
+
+    // 本节点全部 widget 安装宽度守卫（timeline_data 等普通 widget 同样会被污染）
+    for (const w of node.widgets ?? []) guardLegacyWidgetWidth(w);
 
     const tw = node.widgets?.find((x) => x.name === "timeline_data");
     const consoleApi = node.studioConsole;

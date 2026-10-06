@@ -36,59 +36,75 @@ function onAdd() {
 
 // ---------- 任务库（加载/新建/删除/切换，时间线唯一数据源在 SQLite） ----------
 
-type TaskOption = {
-  key: string;
-  label: string;
-  type?: "divider";
-  disabled?: boolean;
-  renderLabel?: (o: TaskOption) => unknown;
-};
+/** 任务条目（来自 SQLite 任务库） */
+type TaskItem = { key: string; label: string };
 
-const taskList = ref<TaskOption[]>([]);
+const taskList = ref<TaskItem[]>([]);
 const taskLabel = computed(() =>
   taskId.value ? store.taskName || `任务 ${taskId.value.slice(-6)}` : "选择任务",
 );
 
-/** 任务项渲染：截断名称 + 删除按钮（点击删除任意任务） */
-function renderTaskLabel(t: TaskOption) {
-  return h(
-    "div",
-    { style: "display:flex;align-items:center;gap:8px;width:100%;justify-content:space-between" },
-    [
-      h(
-        "span",
-        { style: "flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" },
-        t.label,
-      ),
-      h(
-        "span",
-        {
-          style: "cursor:pointer;opacity:.55;flex-shrink:0",
-          title: "删除该任务",
-          onClick: (e: MouseEvent) => {
-            e.stopPropagation();
-            pendingDeleteId.value = t.key;
-            showDeleteConfirm.value = true;
-          },
-        },
-        "🗑",
-      ),
-    ],
-  );
-}
+// ---------- 统一图标（内联 SVG：造型一致、宽度固定，功能项文字自动对齐） ----------
 
-const taskOptions = computed<TaskOption[]>(() => [
-  ...(taskList.value.length
-    ? taskList.value.map((t) => ({ ...t, renderLabel: renderTaskLabel }))
-    : [{ key: "__empty__", label: "（暂无任务）", disabled: true }]),
-  { key: "__div__", type: "divider", label: "" },
-  { key: "__new__", label: "＋ 新建任务" },
-  { key: "__rename__", label: "✏️ 重命名当前任务", disabled: !taskId.value },
-  { key: "__copy__", label: "⧉ 复制当前任务", disabled: !taskId.value },
-  { key: "__export__", label: "⬇ 导出当前任务", disabled: !taskId.value },
-  { key: "__import__", label: "⬆ 导入任务（时间线 + 历史）" },
-  { key: "__delete__", label: "🗑 删除当前任务", disabled: !taskId.value },
+/** Lucide 风格线性图标（24 视口，currentColor 描边） */
+const ICON_BODY: Record<string, string> = {
+  plus: '<path d="M12 5v14M5 12h14"/>',
+  pencil: '<path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/>',
+  copy: '<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/>',
+  download: '<path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/>',
+  upload: '<path d="M12 15V3"/><path d="m7 8 5-5 5 5"/><path d="M5 21h14"/>',
+  trash:
+    '<path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>',
+  history: '<path d="M3 12a9 9 0 1 0 2.6-6.4L3 8"/><path d="M3 3v5h5"/>',
+  layers: '<path d="m12 2 9 5-9 5-9-5 9-5Z"/><path d="m3 12 9 5 9-5"/><path d="m3 17 9 5 9-5"/>',
+  chevron: '<path d="m6 9 6 6 6-6"/>',
+  clapper:
+    '<path d="M20.2 6 3 11l-.9-2.4c-.3-1.1.3-2.2 1.3-2.5l13.5-4c1.1-.3 2.2.3 2.5 1.3Z"/><path d="m6.2 5.3 3.1 3.9"/><path d="m12.4 3.4 3.1 4"/><path d="M3 11h18v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/>',
+  film: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 4v16M17 4v16M3 9h4M3 15h4M17 9h4M17 15h4"/>',
+};
+
+/** 功能项：图标名 + 文案（图标盒宽度统一 → 文案成列对齐） */
+type TaskAction = {
+  key: "new" | "rename" | "copy" | "export" | "import" | "delete";
+  label: string;
+  icon: string;
+  danger: boolean;
+  disabled: boolean;
+};
+
+const taskActions = computed<TaskAction[]>(() => [
+  { key: "new", label: "新建任务", icon: "plus", danger: false, disabled: false },
+  { key: "rename", label: "重命名当前任务", icon: "pencil", danger: false, disabled: !taskId.value },
+  { key: "copy", label: "复制当前任务", icon: "copy", danger: false, disabled: !taskId.value },
+  { key: "export", label: "导出当前任务", icon: "download", danger: false, disabled: !taskId.value },
+  { key: "import", label: "导入任务（时间线 + 历史）", icon: "upload", danger: false, disabled: false },
+  { key: "delete", label: "删除当前任务", icon: "trash", danger: true, disabled: !taskId.value },
 ]);
+
+/** 内联 SVG 图标组件（15px，盒宽写死 → 同一容器内文字起点一致） */
+const TbIcon = (
+  props: { name?: string; class?: string },
+  ctx?: { attrs?: Record<string, unknown> },
+) => {
+  // 兼容函数式组件的两种传参：无声明 props 时 name/class 落在 attrs 里
+  const p = { ...(props ?? {}), ...((ctx?.attrs as Record<string, unknown>) ?? {}) } as {
+    name?: string;
+    class?: string;
+  };
+  return h("svg", {
+    viewBox: "0 0 24 24",
+    width: 15,
+    height: 15,
+    fill: "none",
+    stroke: "currentColor",
+    "stroke-width": 1.9,
+    "stroke-linecap": "round",
+    "stroke-linejoin": "round",
+    "aria-hidden": "true",
+    class: ["tb-ico", p.class ?? ""],
+    innerHTML: ICON_BODY[p.name ?? ""] ?? "",
+  });
+};
 
 /** 时间戳 → 可读时间（任务列表展示） */
 function fmtTime(ts: unknown): string {
@@ -183,6 +199,71 @@ function confirmDeletePipeline() {
       ? `已删除流程「${entry.name}」，${affected} 张卡片回到默认官方流程`
       : `已删除流程「${entry.name}」`,
   );
+}
+
+// ---------- 一键把某份流程应用到所有卡片（批量绑定） ----------
+// 引用模型下只改卡片的 pipelineId：定义仍只有一份，后续编辑该流程所有卡片一起生效。
+
+/** 待应用的流程 id（先弹确认——会覆盖卡片已有的绑定，属于批量改写） */
+const applyingPipelineId = ref<string | null>(null);
+const applyingPipeline = computed(() =>
+  applyingPipelineId.value
+    ? store.pipelines.find((p) => p.id === applyingPipelineId.value) ?? null
+    : null,
+);
+
+/** 影响面：卡片总数 / 绑定会被改写的张数（确认文案用） */
+const applyImpact = computed(() => {
+  const id = applyingPipelineId.value;
+  const total = store.clips.length;
+  if (!id) return { total, changed: 0 };
+  return { total, changed: store.clips.filter((c) => (c.pipelineId ?? null) !== id).length };
+});
+
+function startApplyPipelineToAll(id: string) {
+  if (!store.clips.length) {
+    message.warning("当前任务还没有卡片——先在时间线上添加片段");
+    return;
+  }
+  applyingPipelineId.value = id;
+}
+
+function confirmApplyPipelineToAll() {
+  const entry = applyingPipeline.value;
+  applyingPipelineId.value = null;
+  if (!entry) return;
+  const { changed, total } = store.applyPipelineToAll(entry.id);
+  if (!changed) {
+    message.info(`全部 ${total} 张卡片本就在用「${entry.name}」`);
+    return;
+  }
+  message.success(`已把「${entry.name}」挂到全部 ${total} 张卡片（改写 ${changed} 张绑定）`);
+}
+
+// ---------- 全部取消：所有卡片回退默认官方流程（清引用，不删流程定义） ----------
+
+/** 当前任务里**绑定了自定义流程**的卡片数（决定「全部取消」是否可用 / 文案） */
+const boundClipCount = computed(() => store.clips.filter((c) => !!c.pipelineId).length);
+const clearAllEnabled = computed(() => store.clips.length > 0 && boundClipCount.value > 0);
+const clearAllTitle = computed(() => {
+  if (!store.clips.length) return "当前任务还没有卡片";
+  if (!boundClipCount.value) return "当前任务没有卡片在用自定义流程";
+  return `清除当前任务全部卡片的流程绑定（${boundClipCount.value} 张），回退到默认官方采样流程（流程定义仍保留在库里）`;
+});
+
+/** 全部取消：二次确认（批量清绑定，属于批量改写） */
+const showClearAllConfirm = ref(false);
+
+function confirmClearAll() {
+  showClearAllConfirm.value = false;
+  const bound = boundClipCount.value;
+  const { changed, total } = store.applyPipelineToAll(null); // null = 全回默认官方流程
+  if (!changed) {
+    message.info(`${total} 张卡片已全部是默认官方采样流程`);
+    return;
+  }
+  message.success(`已取消 ${changed} 张卡片的流程绑定，全部回退到默认官方采样流程`);
+  console.info(`[StudioConsole] 全部取消采样流程：${changed}/${total} 张卡片回默认（原有绑定 ${bound} 张）`);
 }
 
 // ---------- 新建 / 重命名 / 复制（弹名称输入，强制非空） ----------
@@ -283,27 +364,36 @@ async function onImportFile(e: Event) {
   }
 }
 
-async function onTaskSelect(key: string) {
-  if (key === "__new__") {
-    openNewTask();
-  } else if (key === "__rename__") {
-    openRename();
-  } else if (key === "__copy__") {
-    openCopy();
-  } else if (key === "__export__") {
-    await onExport();
-  } else if (key === "__import__") {
-    fileInput.value?.click();
-  } else if (key === "__delete__") {
-    if (store.taskId) {
-      pendingDeleteId.value = null; // 删除当前任务
-      showDeleteConfirm.value = true;
-    }
-  } else if (key !== store.taskId) {
-    await store.saveToDb(); // 切换前自动保存当前任务
-    await store.loadTask(key);
-    void refreshTasks(); // 刷新（当前标记更新）
+/** 任务面板显示状态（自定义面板：任务列表 + 功能菜单） */
+const showTaskMenu = ref(false);
+
+/** 选择任务：切换前自动保存当前任务，切换后刷新当前标记 */
+async function selectTask(key: string) {
+  showTaskMenu.value = false;
+  if (key === store.taskId) return;
+  await store.saveToDb(); // 切换前自动保存当前任务
+  await store.loadTask(key);
+  void refreshTasks(); // 刷新（当前标记更新）
+}
+
+/** 功能菜单：新建/重命名/复制/导出/导入/删除 */
+async function runTaskAction(key: TaskAction["key"]) {
+  if (key === "new") openNewTask();
+  else if (key === "rename") openRename();
+  else if (key === "copy") openCopy();
+  else if (key === "export") await onExport();
+  else if (key === "import") fileInput.value?.click(); // 触发系统文件框，面板继续关闭
+  else if (key === "delete" && store.taskId) {
+    pendingDeleteId.value = null; // 删除当前任务
+    showDeleteConfirm.value = true;
   }
+  showTaskMenu.value = false;
+}
+
+/** 任务条目内的删除按钮（可删除列表中任意任务） */
+function askDeleteTask(key: string) {
+  pendingDeleteId.value = key;
+  showDeleteConfirm.value = true;
 }
 
 function onTaskShow(show: boolean) {
@@ -321,7 +411,7 @@ function patchCanvas(p: Record<string, number>) {
 <template>
   <div class="toolbar">
     <div class="toolbar-left">
-      <span class="toolbar-title">🎬 创意工作台</span>
+      <span class="toolbar-title"><TbIcon name="clapper" /> 创意工作台</span>
       <span class="toolbar-sub">{{ clips.length }} 个片段</span>
     </div>
 
@@ -329,18 +419,68 @@ function patchCanvas(p: Record<string, number>) {
       <!-- 数据同步异常提示（不阻断编辑：内容始终保留在本地/会话快照里） -->
       <span v-if="syncWarning" class="tb-warn" :title="syncWarning">⚠ 数据同步异常</span>
 
-      <!-- 任务库：加载/新建/删除（时间线唯一数据源在 SQLite） -->
-      <n-dropdown
+      <!-- 任务库：任务列表（最多 5 行，超出内部滚动）+ 功能菜单（数据源在 SQLite） -->
+      <n-popover
+        v-model:show="showTaskMenu"
         trigger="click"
-        :options="taskOptions"
-        @select="onTaskSelect"
+        placement="bottom-end"
+        :show-arrow="true"
         @update:show="onTaskShow"
       >
-        <button
-          class="tb-btn ghost"
-          :title="store.taskName || taskId || '选择任务'"
-        >{{ taskLabel }} ▾</button>
-      </n-dropdown>
+        <template #trigger>
+          <button
+            class="tb-btn ghost"
+            :title="store.taskName || taskId || '选择任务'"
+          >
+            <TbIcon name="film" />
+            {{ taskLabel }}
+            <TbIcon name="chevron" class="tb-chevron" />
+          </button>
+        </template>
+
+        <div class="tk-panel">
+          <div class="tk-head">
+            <span>任务库</span>
+            <span class="tk-count">{{ taskList.length }} 个</span>
+          </div>
+
+          <!-- 任务列表：最多显示 5 行，超过则容器内滚动，不再撑高整个面板 -->
+          <div class="tk-list" :class="{ 'tk-list--scroll': taskList.length > 5 }">
+            <div v-if="!taskList.length" class="tk-empty">（暂无任务）</div>
+            <button
+              v-for="t in taskList"
+              :key="t.key"
+              class="tk-item"
+              :class="{ active: t.key === taskId }"
+              :title="t.label"
+              @click="selectTask(t.key)"
+            >
+              <TbIcon name="film" class="tk-item-ico" />
+              <span class="tk-item-name">{{ t.label }}</span>
+              <span class="tk-del" title="删除该任务" @click.stop="askDeleteTask(t.key)">
+                <TbIcon name="trash" />
+              </span>
+            </button>
+          </div>
+
+          <div class="tk-divider"></div>
+
+          <!-- 功能菜单：图标盒宽度统一 → 文案同一列对齐 -->
+          <div class="tk-actions">
+            <button
+              v-for="a in taskActions"
+              :key="a.key"
+              class="tk-action"
+              :class="{ danger: a.danger }"
+              :disabled="a.disabled"
+              @click="runTaskAction(a.key)"
+            >
+              <TbIcon :name="a.icon" class="tk-action-ico" />
+              <span class="tk-action-label">{{ a.label }}</span>
+            </button>
+          </div>
+        </div>
+      </n-popover>
       <!-- 导入任务文件选择（隐藏 input，由菜单项触发） -->
       <input ref="fileInput" type="file" accept=".json,application/json" style="display: none" @change="onImportFile" />
 
@@ -350,9 +490,10 @@ function patchCanvas(p: Record<string, number>) {
         class="tb-btn ghost"
         title="从当前任务的历史版本快照中手动挑选片段恢复到时间线"
         @click="store.openRestoreModal()"
-      >↩ 恢复片段</button>
+      ><TbIcon name="history" /> 恢复片段</button>
 
-      <!-- 采样流程库：新建/编辑/重命名/复制/删除 + 导入导出（片段的流程选择在卡片 ⊞ 下拉里） -->
+      <!-- 采样流程库：新建/编辑/重命名/复制/删除 + 导入导出
+           （片段的流程选择在卡片 ⊞ 下拉里） -->
       <n-popover
         v-model:show="showPipelineManager"
         trigger="click"
@@ -363,13 +504,13 @@ function patchCanvas(p: Record<string, number>) {
           <button
             class="tb-btn ghost"
             :title="`自定义采样流程（${store.pipelines.length} 份）：新建/编辑/导入导出；片段上点 ⊞ 选用`"
-          >⊞ 自定义采样流程{{ store.pipelines.length ? ` ${store.pipelines.length}` : "" }}</button>
+          ><TbIcon name="layers" /> 自定义采样流程{{ store.pipelines.length ? ` ${store.pipelines.length}` : "" }}</button>
         </template>
 
         <div class="pl-panel">
           <div class="pl-head">
             自定义采样流程
-            <span class="pl-hint">片段上点 ⊞ 选择用哪一份</span>
+            <span class="pl-hint">片段上点 ⊞ 选择，「全用」挂到所有卡片</span>
           </div>
 
           <div v-if="!store.pipelines.length" class="pl-empty">
@@ -383,6 +524,16 @@ function patchCanvas(p: Record<string, number>) {
                 <span class="pl-use">{{ store.pipelineUsage(p.id) }} 张卡片引用</span>
               </div>
               <div class="pl-row-actions">
+                <button
+                  class="pl-btn apply"
+                  :disabled="!store.clips.length"
+                  :title="
+                    store.clips.length
+                      ? `把「${p.name}」挂到当前任务的全部 ${store.clips.length} 张卡片（覆盖已有绑定）`
+                      : '当前任务还没有卡片'
+                  "
+                  @click="startApplyPipelineToAll(p.id)"
+                >全用</button>
                 <button class="pl-btn" title="打开原生子图编辑器" @click="onEditPipeline(p.id)">编辑</button>
                 <button class="pl-btn" title="重命名" @click="startRenamePipeline(p.id)">改名</button>
                 <button class="pl-btn" title="复制为新流程（要独立改一份时用）" @click="onDuplicatePipeline(p.id)">复制</button>
@@ -401,6 +552,12 @@ function patchCanvas(p: Record<string, number>) {
             <button class="pl-btn" title="导入流程文件（.studio-pipeline.json）" @click="pipelineFileInput?.click()">
               导入…
             </button>
+            <button
+              class="pl-btn danger clear-all"
+              :disabled="!clearAllEnabled"
+              :title="clearAllTitle"
+              @click="showClearAllConfirm = true"
+            >全部取消</button>
           </div>
         </div>
       </n-popover>
@@ -421,7 +578,7 @@ function patchCanvas(p: Record<string, number>) {
       />
 
       <span class="tb-total">总时长 {{ formatTotal(totalDurationSec) }}</span>
-      <button class="tb-btn accent" title="添加片段" @click="onAdd">＋ 片段</button>
+      <button class="tb-btn accent" title="添加片段" @click="onAdd"><TbIcon name="plus" /> 片段</button>
     </div>
 
     <!-- 新建/重命名任务：名称输入（强制非空，空名称禁用确定） -->
@@ -484,6 +641,34 @@ function patchCanvas(p: Record<string, number>) {
       @close="deletingPipelineId = null"
     />
 
+    <!-- 一键把流程应用到所有卡片：二次确认（会覆盖卡片已有的绑定） -->
+    <n-modal
+      :show="!!applyingPipelineId"
+      preset="dialog"
+      title="应用到所有卡片"
+      :content="`将把流程「${applyingPipeline?.name ?? ''}」挂到当前任务的全部 ${
+        applyImpact.total
+      } 张卡片（其中 ${applyImpact.changed} 张的绑定会被改写）。定义只有一份，之后编辑该流程所有卡片一起生效。确定？`"
+      positive-text="全部应用"
+      negative-text="取消"
+      @positive-click="confirmApplyPipelineToAll"
+      @negative-click="applyingPipelineId = null"
+      @close="applyingPipelineId = null"
+    />
+
+    <!-- 全部取消：所有卡片回退默认官方流程（只清绑定，不删流程定义） -->
+    <n-modal
+      :show="showClearAllConfirm"
+      preset="dialog"
+      title="全部取消采样流程"
+      :content="`将清除当前任务全部卡片的流程绑定（${boundClipCount} 张在用自定义流程），回退到默认官方采样流程。流程定义仍保留在库里，之后可以再挂上。确定？`"
+      positive-text="全部取消"
+      negative-text="返回"
+      @positive-click="confirmClearAll"
+      @negative-click="showClearAllConfirm = false"
+      @close="showClearAllConfirm = false"
+    />
+
     <!-- 删除任务：二次确认 -->
     <n-modal
       :show="showDeleteConfirm"
@@ -518,6 +703,9 @@ function patchCanvas(p: Record<string, number>) {
   min-width: 0;
 }
 .toolbar-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   font-size: 14px;
   font-weight: 600;
   color: var(--dc-text);
@@ -560,6 +748,9 @@ function patchCanvas(p: Record<string, number>) {
 }
 
 .tb-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   border: 1px solid var(--dc-border);
   background: var(--dc-bg);
   color: var(--dc-text);
@@ -570,6 +761,15 @@ function patchCanvas(p: Record<string, number>) {
   cursor: pointer;
   transition: all 0.12s ease;
   white-space: nowrap;
+}
+/* 统一图标：固定 15px，收缩不参与压缩 → 同一容器内文字起点一致 */
+.tb-ico {
+  flex: 0 0 auto;
+  display: block;
+  opacity: 0.9;
+}
+.tb-chevron {
+  opacity: 0.55;
 }
 .tb-btn:hover {
   border-color: v-bind("palette.accent");
@@ -595,13 +795,157 @@ function patchCanvas(p: Record<string, number>) {
   background: transparent;
 }
 
+/* ---------- 任务库面板（任务列表 + 功能菜单；列表最多 5 行后内部滚动） ---------- */
+.tk-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 2px;
+  width: 280px;
+}
+.tk-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  font-size: 12px;
+  color: var(--dc-text);
+}
+.tk-count {
+  font-size: 10px;
+  color: var(--dc-text-faint);
+  font-variant-numeric: tabular-nums;
+}
+/* 任务区：最多 5 行，超出只滚动列表，不把面板顶下去 */
+.tk-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: calc(5 * 34px);
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+.tk-list--scroll {
+  padding-right: 2px;
+}
+.tk-empty {
+  padding: 8px;
+  font-size: 11px;
+  color: var(--dc-text-dim);
+  text-align: center;
+}
+.tk-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 32px;
+  height: 32px;
+  padding: 0 8px;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--dc-text-dim);
+  font-size: 12px;
+  line-height: 1;
+  text-align: left;
+  cursor: pointer;
+}
+.tk-item:hover {
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--dc-text);
+}
+.tk-item.active {
+  background: var(--dc-accent-dim);
+  border-color: var(--dc-accent);
+  color: var(--dc-text);
+}
+.tk-item-ico {
+  flex: 0 0 auto;
+  opacity: 0.65;
+}
+.tk-item-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 删除按钮：默认隐藏，悬停任务行才浮现，避免列表噪音 */
+.tk-del {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 4px;
+  opacity: 0;
+  transition: opacity 0.12s ease, color 0.12s ease, background 0.12s ease;
+}
+.tk-item:hover .tk-del {
+  opacity: 0.6;
+}
+.tk-del:hover {
+  opacity: 1;
+  color: var(--dc-danger);
+  background: rgba(248, 113, 113, 0.14);
+}
+.tk-divider {
+  height: 1px;
+  margin: 0 -2px;
+  background: var(--dc-border);
+}
+.tk-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.tk-action {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 30px;
+  padding: 0 8px;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--dc-text-dim);
+  font-size: 12px;
+  line-height: 1;
+  text-align: left;
+  cursor: pointer;
+}
+.tk-action:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--dc-text);
+}
+.tk-action:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+.tk-action.danger:hover:not(:disabled) {
+  color: var(--dc-danger);
+  background: rgba(248, 113, 113, 0.12);
+}
+/* 图标盒统一宽度（所有功能项文字从同一列开始） */
+.tk-action-ico {
+  flex: 0 0 15px;
+  opacity: 0.8;
+}
+.tk-action-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* ---------- 采样流程库面板（工具栏弹出；样式对齐 ResolutionParam 的 .res-pop 一套） ---------- */
 .pl-panel {
   display: flex;
   flex-direction: column;
   gap: 8px;
   padding: 2px;
-  width: 360px;
+  width: 400px;
 }
 .pl-head {
   display: flex;
@@ -681,6 +1025,19 @@ function patchCanvas(p: Record<string, number>) {
   background: rgba(255, 255, 255, 0.08);
   color: var(--dc-text);
 }
+/* 批量应用：主要动作，视觉上略强（但不用 primary 实心，避免与「＋ 新建流程」抢焦点） */
+.pl-btn.apply {
+  border-color: var(--dc-accent);
+  color: var(--dc-text);
+}
+.pl-btn:disabled,
+.pl-btn:disabled:hover {
+  opacity: 0.4;
+  cursor: not-allowed;
+  border-color: var(--dc-border);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--dc-text-faint);
+}
 .pl-btn.primary {
   border-color: transparent;
   background: v-bind("palette.accent");
@@ -699,5 +1056,13 @@ function patchCanvas(p: Record<string, number>) {
   gap: 8px;
   padding-top: 8px;
   border-top: 1px solid var(--dc-border);
+}
+/* 全部取消：批量撤销动作，靠右与「新建/导入」拉开距离（视觉上不易误点） */
+.pl-btn.clear-all {
+  margin-left: auto;
+}
+.pl-btn.clear-all:not(:disabled):hover {
+  border-color: var(--dc-danger);
+  color: var(--dc-danger);
 }
 </style>

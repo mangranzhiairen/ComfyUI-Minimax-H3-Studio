@@ -66,6 +66,25 @@ function shotSamplesOf(versionId: number): VersionSample[] {
 function isLocked(sample: VersionSample): boolean {
   return props.clip.sampleFp === sample.sampleFp;
 }
+
+/** 实际保存的 latent 像素尺寸标签（空串 = 无记录/旧样本） */
+function latentLabel(s: VersionSample): string {
+  const w = Number(s.latentWidth) || 0;
+  const h = Number(s.latentHeight) || 0;
+  return w > 0 && h > 0 ? `${w}x${h}` : "";
+}
+/** 实际 latent 尺寸是否与采样画布不同（自定义采样流程二采放大时） */
+function latentDiffers(s: VersionSample): boolean {
+  const m = /^(\d+)x(\d+)@/.exec(s.canvas ?? "");
+  if (!m || !latentLabel(s)) return false;
+  return Number(m[1]) !== Number(s.latentWidth) || Number(m[2]) !== Number(s.latentHeight);
+}
+function latentTitle(s: VersionSample): string {
+  const label = latentLabel(s) || "N/A";
+  return latentDiffers(s)
+    ? `实际 latent 尺寸 ${label}，与采样画布 ${s.canvas} 不一致（自定义采样流程可能二采放大）`
+    : `实际 latent 尺寸 ${label}`;
+}
 function selectEntry(versionId: number): void {
   selectedId.value = versionId;
 }
@@ -479,6 +498,12 @@ const snapMediaRow = computed<{ preview?: string; icon: string; label: string }[
                 </label>
                 <span class="shot-seed">seed {{ s.seed }}</span>
                 <span v-if="s.durationSec" class="shot-dur">{{ s.durationSec }}s</span>
+                <span
+                  v-if="latentLabel(s)"
+                  class="shot-latent"
+                  :class="{ mismatch: latentDiffers(s) }"
+                  :title="latentTitle(s)"
+                >latent {{ latentLabel(s) }}</span>
                 <span class="shot-time">{{ fmtTime(s.createdAt) }}</span>
               </div>
               <!-- 画布徽标常驻：每个样本都显示其采样分辨率（蓝色样式，与当前画布不一致时启用会提示切换） -->
@@ -508,7 +533,7 @@ const snapMediaRow = computed<{ preview?: string; icon: string; label: string }[
       <div v-if="previewSample" class="preview-pop" @click.stop>
         <canvas ref="previewCanvas" class="preview-pop-canvas"></canvas>
         <div class="preview-pop-info">
-          <span>seed {{ previewSample.seed }} · {{ previewSample.durationSec || "?" }}s · {{ previewSample.canvas || "?" }}</span>
+          <span>seed {{ previewSample.seed }} · {{ previewSample.durationSec || "?" }}s · {{ previewSample.canvas || "?" }} · latent {{ latentLabel(previewSample) || "?" }}</span>
           <button class="mini-btn" @click="closePreview">关闭</button>
         </div>
       </div>
@@ -851,6 +876,15 @@ const snapMediaRow = computed<{ preview?: string; icon: string; label: string }[
 .shot-dur {
   color: var(--dc-text-dim);
   font-variant-numeric: tabular-nums;
+}
+/* 实际保存的 latent 尺寸；与采样画布不一致时高亮（自定义采样流程二采放大） */
+.shot-latent {
+  color: #a7f3d0;
+  font-variant-numeric: tabular-nums;
+}
+.shot-latent.mismatch {
+  color: #fca5a5;
+  font-weight: 600;
 }
 /* 画布徽标（常驻显示，统一蓝色样式） */
 .shot-canvas {

@@ -244,6 +244,11 @@ export interface VersionSample {
   continuity: boolean;
   frames: number;
   sampleLen: number;
+  /** 实际保存的 latent 像素宽度（自定义采样流程可能二采放大，与 canvas 不同；
+   *  旧记录无此值为 null/undefined = N/A） */
+  latentWidth?: number | null;
+  /** 实际保存的 latent 像素高度 */
+  latentHeight?: number | null;
   createdAt: number;
   /** latent 文件是否仍存在 */
   exists: boolean;

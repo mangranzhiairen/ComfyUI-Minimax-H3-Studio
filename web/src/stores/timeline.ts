@@ -308,6 +308,25 @@ export const useTimelineStore = defineStore("timeline", {
       else delete seg.pipelineId;
     },
 
+    /** 一键把某份流程挂到**当前任务的全部卡片**（null = 全部回到默认官方流程）。
+     *
+     *  引用模型下这是一次纯批量绑定：定义只存一份（任务级流程库），卡片只改 pipelineId，
+     *  因此不存在"复制 N 份定义"的膨胀，之后改流程仍是一处改、全部生效。
+     *
+     *  @returns `{ changed, total }`：绑定被改写的张数 / 卡片总数（UI 回显用） */
+    applyPipelineToAll(pipelineId: string | null): { changed: number; total: number } {
+      let changed = 0;
+      for (const seg of this.clips) {
+        if ((seg.pipelineId ?? null) === pipelineId) continue;
+        if (pipelineId) seg.pipelineId = pipelineId;
+        else delete seg.pipelineId;
+        changed += 1;
+      }
+      // 批量绑定改的是任务数据（clips）→ 落时间线
+      if (changed) void this.saveToDb();
+      return { changed, total: this.clips.length };
+    },
+
     updateClip(id: string, patch: Partial<Clip>): void {
       const seg = this.clips.find((s) => s.id === id);
       if (!seg) return;
