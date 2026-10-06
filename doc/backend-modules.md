@@ -137,10 +137,16 @@ clip_versions    历史版本（纯 Model）：id / task_id / clip_id / content_
 version_samples  采样记录：id / task_id / clip_id / version_id / content_fp / canvas / sample_fp
                  / seed / duration_sec / continuity / frames / sample_len / created_at
                  UNIQUE(task_id, clip_id, sample_fp)
+pipeline_library 全局采样流程库（**跨任务共享，不属于任何任务**）：id / name / def(子图 JSON) / updated_at
+                 —— 片段只存 pipelineId 引用；新建/切换/删除任务都不动它
 ```
 
 - 历史只在采样成功时固化（`record_version_sample`）：同 clip 同 content_fp 复用条目，否则新建；样本 INSERT OR REPLACE。
-- `init_db()`：无文件建表；有文件校验关键结构，不符直接删库重建（开发期策略，不做迁移）。
+- **全局采样流程库**（`pipeline_library`）：流程是**可复用的工艺资产**，不属于某条片子——放任务里会随任务切换消失，也无法一处改到处生效。接口是「读全库 / 覆盖式整库保存」`GET|PUT /pipelines`（与 timeline 同款：前端权威 + DB 纯持久化），`save_pipeline_library` 在一个事务里整库替换（半更新的库比旧库更糟：会出现指向不存在定义的引用）。
+  - 前端守卫 `pipelinesLoaded`：**没读到库里已有定义就拒绝整库回写**（否则空库覆盖 = 把用户的全部自定义流程删光）；后端再加一道：空覆盖非空库必须显式 `confirm_clear`（否则 409）。
+  - 导出 `export_task` 只内嵌**被引用**的流程（`referenced_pipelines`）；`import_task` 用 `merge_pipeline_library` 按 id 并入导入方的全局库（**已存在的 id 保留本地那份**，新 id 重名自动加「（N）」后缀）。
+  - `_strip_sample_locks` 顺带丢弃历史遗留的 `timeline.pipelines`；老库里已有的定义由 `_migrate_inline_pipelines`（`user_version` 一次性迁移）收编进全局库，不丢数据。
+- `init_db()`：**只增不减，绝不删库/删表**。它挂在每个 DB 操作入口（避免 no such table/column），但内部按**库文件路径**记忆（模块级 `_schema_ready` + 锁）：真正的建表/补列每进程只执行一次，其余调用只是「命中标记 + 一次 stat」，库文件被删掉时自愈。`_SCHEMA_SQL` 幂等补表 + `_SCHEMA_COLUMNS` 幂等补列（`ALTER TABLE ADD COLUMN`）+ `PRAGMA user_version` 记结构代际；需要搬数据时按 `user_version` 写一次性迁移步骤。旧的「结构不符就删文件重建」已移除；库文件损坏时报错但不删除（由用户备份后处理）。
 
 ### 7.2 latent 文件与两级指纹
 

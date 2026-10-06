@@ -227,6 +227,43 @@ async def save_task_timeline(request: web.Request) -> web.Response:
         return web.Response(status=500, text=str(exc))
 
 
+async def get_pipeline_library(request: web.Request) -> web.Response:
+    """GET /minimax/studio/pipelines → {pipelines: [{id, name, def}, …]}
+
+    全局采样流程库（跨任务共享，不属于任何任务）：片段只存 pipelineId 引用。
+    """
+    try:
+        from .segment_cache import list_pipeline_library as db_list
+
+        return web.json_response({"pipelines": db_list()})
+    except Exception as exc:  # noqa: BLE001
+        log.warning("读取采样流程库失败: %s", exc)
+        return web.Response(status=500, text=str(exc))
+
+
+async def save_pipeline_library(request: web.Request) -> web.Response:
+    """PUT /minimax/studio/pipelines  body: {pipelines: [...], confirm_clear?} → {ok, count}
+
+    覆盖式**整库**保存（前端权威 + DB 纯持久化，与 timeline 同款）。409 = 空库覆盖
+    非空库且未显式 confirm_clear（防"还没加载就整库提交"把用户的流程全删光）。
+    """
+    try:
+        from .segment_cache import save_pipeline_library as db_save
+
+        body = await request.json()
+        entries = body.get("pipelines")
+        if not isinstance(entries, list):
+            return web.Response(status=400, text="pipelines 必须是数组")
+        count = db_save(entries, confirm_clear=bool(body.get("confirm_clear")))
+        return web.json_response({"ok": True, "count": count})
+    except ValueError as exc:  # 空覆盖保护
+        log.warning("拒绝保存采样流程库: %s", exc)
+        return web.Response(status=409, text=str(exc))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("保存采样流程库失败: %s", exc)
+        return web.Response(status=500, text=str(exc))
+
+
 async def rename_task(request: web.Request) -> web.Response:
     """PUT /minimax/studio/tasks/{task_id}/name  body: {name} → {ok}"""
     try:
@@ -511,6 +548,9 @@ def register_routes() -> bool:
         "/minimax/studio/tasks/import",
         import_task,
     )
+    # 全局采样流程库（跨任务共享）：读全库 / 覆盖式整库保存
+    _register_route(server.routes, "GET", "/minimax/studio/pipelines", get_pipeline_library)
+    _register_route(server.routes, "PUT", "/minimax/studio/pipelines", save_pipeline_library)
     _ROUTES_REGISTERED = True
     log.info("MiniMax H3 创意工作台 HTTP 路由已注册")
     return True

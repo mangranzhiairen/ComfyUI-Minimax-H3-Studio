@@ -50,11 +50,14 @@ export const REFERENCE_LIMITS = {
 } as const;
 
 /**
- * 任务级采样流程库条目：一份采样流程（子图）定义。
+ * **全局**采样流程库条目：一份采样流程（子图）定义。
  *
  * **引用模型**：片段只记 `pipelineId`，定义存在库里 —— 一份流程可挂多张卡片，
  * 改一处所有引用它的片段都跟着变（要独立改就"复制为新流程"）。
  * 未绑定（`pipelineId` 为空）= 走内置官方流程。
+ *
+ * 库的作用域是**全局**（跨任务共享，不属于任何任务）：后端 `pipeline_library` 表，
+ * 经 `/minimax/studio/pipelines` 读写。任务时间线里不再存定义。
  */
 export interface PipelineLibraryEntry {
   /** 流程 id：前端生成的 UUID，同时作子图 id（前端按 uuid 校验 + URL hash 定位） */

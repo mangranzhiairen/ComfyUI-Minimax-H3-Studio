@@ -1,4 +1,4 @@
-"""纯函数层验证：契约解析/校验、Task 注入与条件构建、Motion Context 网格、缓存工具。
+"""纯函数层验证：契约解析/校验、Task 注入与条件构建、Motion Context 网格、任务库与缓存工具。
 
 运行（无需 ComfyUI 环境）：
     python tests/test_studio.py
@@ -6,6 +6,10 @@
 
 from __future__ import annotations
 
+import gc
+import json
+import os
+import shutil
 import sys
 import unittest
 from pathlib import Path
@@ -499,8 +503,11 @@ class SegmentCacheUtilTest(unittest.TestCase):
                 {"id": "clip_a", "enabled": True, "sampleFp": "abc123", "prompt": "x"},
                 {"id": "clip_b", "enabled": False},
             ],
+            # 历史遗留的内联流程定义：全局化之后时间线里不再带定义，清洗时一并丢弃
+            "pipelines": [{"id": "p_old", "name": "旧流程", "def": {}}],
         }
         out = _strip_sample_locks(timeline)
+        self.assertNotIn("pipelines", out)  # 定义只住全局库一处
         self.assertNotIn("sampleFp", out["clips"][0])
         self.assertEqual(out["clips"][1], {"id": "clip_b", "enabled": False})
         # 非 dict clip 行容错跳过；剥离返回新对象，不就地修改原输入
@@ -516,6 +523,280 @@ class SegmentCacheUtilTest(unittest.TestCase):
 
         self.assertEqual(EXPORT_TYPE, "minimax-h3-studio-task")
         self.assertEqual(EXPORT_FORMAT_VERSION, 1)
+
+
+class DatabaseTestBase(unittest.TestCase):
+    """任务库相关用例的公共夹具：把 folder_paths 指到仓库内的独占临时目录。"""
+
+    def setUp(self):
+        import types
+
+        # 临时库建在仓库内（系统 temp 可能被沙箱 ACL 拒绝创建子目录）；每个用例一个独占目录，
+        # 避免上一条用例残留的库文件（句柄未释放时删不掉）串进下一条。
+        # 不用 tempfile.TemporaryDirectory：它的 cleanup 会 chmod，在沙箱下非零退出。
+        # 目录名用「进程 + 用例名」：init_db 的"已就绪"标记按路径记忆，路径不重复才不会串台
+        self.root = Path(__file__).resolve().parent / f".db_test_tmp_{os.getpid()}_{self._testMethodName}"
+        self.root.mkdir(parents=True, exist_ok=True)
+        stub = types.ModuleType("folder_paths")
+        stub.get_user_directory = lambda: str(self.root)
+        stub.get_output_directory = lambda: str(self.root)
+        self._prev = sys.modules.get("folder_paths")
+        sys.modules["folder_paths"] = stub
+
+        import studio.segment_cache as segment_cache
+
+        self.sc = segment_cache
+
+    def tearDown(self):
+        if self._prev is not None:
+            sys.modules["folder_paths"] = self._prev
+        else:
+            sys.modules.pop("folder_paths", None)
+        gc.collect()  # 释放 sqlite 句柄后再删目录（Windows 上句柄会锁住文件）
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def _raw(self):
+        import sqlite3
+
+        return sqlite3.connect(self.sc.db_path())
+
+class DatabaseLifecycleTest(DatabaseTestBase):
+    """任务库生命周期：只增不减的就地升级 + 删除时的跨任务文件引用保护。
+
+    latent/preview 文件按采样指纹命名、**同节点跨任务共享**，因此删任务/删片段
+    必须先确认没有其他记录还引用它；数据库结构演进只允许 ADD，绝不删库重建。
+    """
+
+    def test_fresh_init_creates_schema_and_version(self):
+        self.sc.init_db()
+        with self._raw() as conn:
+            tables = {
+                r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+            }
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+        self.assertTrue({"tasks", "clip_versions", "version_samples"} <= tables)
+        self.assertEqual(version, self.sc._SCHEMA_VERSION)
+
+    def test_legacy_db_is_upgraded_in_place_without_data_loss(self):
+        """旧结构库：缺表补表、缺列补列，**绝不删库**（早期实现是删库重建）。"""
+        import sqlite3
+
+        db = self.sc.db_path()
+        db.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(db) as conn:
+            # 模拟早期结构：tasks 少列 + clip_versions 少列 + 没有 version_samples 表
+            conn.execute("CREATE TABLE tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, timeline TEXT)")
+            conn.execute(
+                "INSERT INTO tasks (id, timeline) VALUES (1, ?)",
+                ('{"clips": [{"id": "keep_me"}]}',),
+            )
+            conn.execute(
+                "CREATE TABLE clip_versions (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id INTEGER)"
+            )
+
+        self.sc.init_db()
+
+        with sqlite3.connect(db) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT * FROM tasks WHERE id = 1").fetchone()
+            task_cols = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
+            ver_cols = {r[1] for r in conn.execute("PRAGMA table_info(clip_versions)")}
+            tables = {
+                r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+            }
+        self.assertIn("keep_me", row["timeline"])  # 原有数据还在
+        self.assertIn("node_id", task_cols)  # 缺列补齐
+        self.assertIn("snapshot", ver_cols)
+        self.assertIn("version_samples", tables)  # 缺表补齐
+        self.assertEqual(row["name"], "")  # 补列带默认值，旧行可读不炸
+
+    def test_init_db_runs_once_per_path_and_self_heals(self):
+        """19 个入口都调 init_db()，但真正的初始化每进程每路径只跑一次；库文件被删掉后能自愈。"""
+        calls: list[str] = []
+        original = self.sc._init_db_once
+
+        def _counted(path):
+            calls.append(str(path))
+            return original(path)
+
+        self.sc._init_db_once = _counted  # type: ignore[assignment]
+        try:
+            for _ in range(5):
+                self.sc.init_db()
+            self.assertEqual(len(calls), 1)  # 后 4 次都是空转
+
+            self.sc.db_path().unlink()  # 运行中库文件没了 → 下次调用必须重建
+            self.sc.init_db()
+            self.assertEqual(len(calls), 2)
+            self.assertTrue(self.sc.db_path().exists())
+        finally:
+            self.sc._init_db_once = original  # type: ignore[assignment]
+            self.sc._schema_ready.clear()
+
+    def test_corrupt_db_is_reported_but_never_deleted(self):
+        db = self.sc.db_path()
+        db.parent.mkdir(parents=True, exist_ok=True)
+        db.write_bytes(b"definitely not a sqlite database")
+
+        with self.assertRaises(RuntimeError) as ctx:
+            self.sc.init_db()
+
+        self.assertTrue(db.exists())  # 插件绝不自作主张删库
+        self.assertEqual(db.read_bytes(), b"definitely not a sqlite database")
+        self.assertIn("不会删除", str(ctx.exception))
+
+
+class PipelineLibraryTest(DatabaseTestBase):
+    """全局采样流程库：跨任务共享、覆盖式整库保存（导入按 id 并入）、导出内嵌被引用定义。"""
+
+    def _entry(self, pid: str, name: str = "流程", payload: str = "a") -> dict:
+        return {"id": pid, "name": name, "def": {"id": pid, "nodes": [{"payload": payload}]}}
+
+    def _timeline(self, *pipeline_ids: str) -> dict:
+        return {
+            "version": 1,
+            "canvas": {"fps": 24, "width": 864, "height": 480},
+            "clips": [
+                {"id": f"clip_{i}", "mode": "t2v", "pipelineId": pid}
+                for i, pid in enumerate(pipeline_ids)
+            ],
+            "totalDurationSec": 4,
+        }
+
+    def test_save_and_list_round_trip(self):
+        """整库覆盖语义：后一次提交就是全库内容；def 以对象形态读回。"""
+        self.assertEqual(self.sc.save_pipeline_library([self._entry("p1", "流程一")]), 1)
+        self.sc.save_pipeline_library([self._entry("p1", "流程一"), self._entry("p2", "流程二", "b")])
+
+        items = self.sc.list_pipeline_library()
+        self.assertEqual({p["id"] for p in items}, {"p1", "p2"})
+        self.assertEqual(
+            next(p for p in items if p["id"] == "p2")["def"]["nodes"][0]["payload"], "b"
+        )
+
+        self.sc.save_pipeline_library([self._entry("p2", "流程二", "b")])  # 只留一份
+        self.assertEqual([p["id"] for p in self.sc.list_pipeline_library()], ["p2"])
+
+    def test_invalid_entries_are_dropped(self):
+        """非法条目（缺 id / 缺名字 / def 不是对象）直接丢弃，不写坏库。"""
+        bad = [
+            {"id": "", "name": "无 id", "def": {}},
+            {"id": "no_name", "name": "  ", "def": {}},
+            {"id": "no_def", "name": "无定义"},
+            {"id": "bad_def", "name": "定义不是对象", "def": "x"},
+            "not a dict",
+        ]
+        self.assertEqual(self.sc.save_pipeline_library(bad), 0)
+        self.assertEqual(self.sc.list_pipeline_library(), [])
+
+    def test_empty_overwrite_needs_confirm_clear(self):
+        """空库覆盖非空库要显式确认——防"还没加载就整库提交"把用户的流程删光。"""
+        self.sc.save_pipeline_library([self._entry("p1")])
+        with self.assertRaises(ValueError):
+            self.sc.save_pipeline_library([])
+        self.assertEqual(len(self.sc.list_pipeline_library()), 1)  # 被拦下，库完好
+
+        self.assertEqual(self.sc.save_pipeline_library([], confirm_clear=True), 0)
+        self.assertEqual(self.sc.list_pipeline_library(), [])
+
+    def test_inline_pipelines_migrated_from_legacy_timeline(self):
+        """历史任务把定义内联在 timeline.pipelines → 一次性收编进全局库并从 timeline 删掉。"""
+        timeline = self._timeline("p_old")
+        timeline["pipelines"] = [{"id": "p_old", "name": "旧流程", "def": {"id": "p_old", "nodes": []}}]
+        tid = self.sc.create_task("node1", json.dumps(timeline, ensure_ascii=False), {}, name="旧任务")
+
+        # 模拟"升级前就存在的库"：结构版本退回 2，让 init_db 再跑一次迁移
+        with self._raw() as conn:
+            conn.execute("PRAGMA user_version = 2")
+        self.sc._schema_ready.clear()
+        self.sc.init_db()
+
+        self.assertEqual([p["id"] for p in self.sc.list_pipeline_library()], ["p_old"])
+        stored = json.loads(self.sc.get_task(tid)["timeline"])
+        self.assertNotIn("pipelines", stored)  # 定义只留全局库一处
+        self.assertEqual(stored["clips"][0]["pipelineId"], "p_old")  # 引用不动
+
+        # 幂等：再跑一次不会重复收编、也不会报错
+        self.sc._schema_ready.clear()
+        self.sc.init_db()
+        self.assertEqual(len(self.sc.list_pipeline_library()), 1)
+
+    def test_export_embeds_only_referenced_pipelines(self):
+        self.sc.save_pipeline_library([self._entry("p_keep", "用上的"), self._entry("p_unused", "没用上")])
+        tid = self.sc.create_task(
+            "node1", json.dumps(self._timeline("p_keep"), ensure_ascii=False), {}, name="带流程"
+        )
+        exported = self.sc.export_task(tid)
+        self.assertEqual([p["id"] for p in exported["pipelines"]], ["p_keep"])
+        self.assertNotIn("pipelines", exported["timeline"])  # 时间线里再带一份就是两处真相
+
+    def test_import_merges_embedded_pipelines(self):
+        """导入方库里没有该流程 → 按 id 并入；任务时间线只留引用。"""
+        imported = {
+            "type": self.sc.EXPORT_TYPE,
+            "formatVersion": self.sc.EXPORT_FORMAT_VERSION,
+            "name": "外来任务",
+            "timeline": self._timeline("p_in"),
+            "pipelines": [{"id": "p_in", "name": "外来流程", "def": {"id": "p_in", "nodes": []}}],
+        }
+        tid = self.sc.import_task(imported, "node1")
+
+        self.assertEqual([p["id"] for p in self.sc.list_pipeline_library()], ["p_in"])
+        stored = json.loads(self.sc.get_task(tid)["timeline"])
+        self.assertNotIn("pipelines", stored)
+        self.assertEqual(stored["clips"][0]["pipelineId"], "p_in")
+
+    def test_import_keeps_local_def_on_id_conflict(self):
+        """同 id 撞车：**保留导入方本地那份**（别人的同名流程不许覆盖自己的工艺）。"""
+        self.sc.save_pipeline_library([self._entry("p1", "本机的", "mine")])
+        imported = {
+            "type": self.sc.EXPORT_TYPE,
+            "formatVersion": self.sc.EXPORT_FORMAT_VERSION,
+            "name": "撞车",
+            "timeline": self._timeline("p1"),
+            "pipelines": [{"id": "p1", "name": "外来的", "def": {"id": "p1", "nodes": [{"payload": "theirs"}]}}],
+        }
+        tid = self.sc.import_task(imported, "node1")
+
+        items = self.sc.list_pipeline_library()
+        self.assertEqual(len(items), 1)  # 不新增、不覆盖
+        self.assertEqual(items[0]["def"]["nodes"][0]["payload"], "mine")
+        self.assertEqual(items[0]["name"], "本机的")
+
+        stored = json.loads(self.sc.get_task(tid)["timeline"])
+        self.assertEqual(stored["clips"][0]["pipelineId"], "p1")  # 引用照旧
+
+    def test_import_renames_on_name_collision(self):
+        """新 id 但重名 → 自动加「（N）」后缀，不出现两条同名流程。"""
+        self.sc.save_pipeline_library([self._entry("p1", "通用流程", "mine")])
+        imported = {
+            "type": self.sc.EXPORT_TYPE,
+            "formatVersion": self.sc.EXPORT_FORMAT_VERSION,
+            "name": "重名",
+            "timeline": self._timeline("p2"),
+            "pipelines": [{"id": "p2", "name": "通用流程", "def": {"id": "p2", "nodes": []}}],
+        }
+        self.sc.import_task(imported, "node1")
+
+        names = sorted(p["name"] for p in self.sc.list_pipeline_library())
+        self.assertEqual(names, ["通用流程", "通用流程（2）"])
+
+    def test_export_import_round_trip(self):
+        """导出 → 清空全局库 → 导入：流程定义完整回到全局库，引用可解析。"""
+        self.sc.save_pipeline_library([self._entry("p_rt", "往返", "round")])
+        tid = self.sc.create_task(
+            "node1", json.dumps(self._timeline("p_rt"), ensure_ascii=False), {}, name="往返"
+        )
+        exported = self.sc.export_task(tid)
+        self.sc.save_pipeline_library([], confirm_clear=True)
+        self.assertEqual(self.sc.list_pipeline_library(), [])
+
+        new_tid = self.sc.import_task(exported, "node1")
+        items = self.sc.list_pipeline_library()
+        self.assertEqual([p["id"] for p in items], ["p_rt"])
+        self.assertEqual(items[0]["def"]["nodes"][0]["payload"], "round")
+        stored = json.loads(self.sc.get_task(new_tid)["timeline"])
+        self.assertEqual(stored["clips"][0]["pipelineId"], "p_rt")
 
 
 class OfficialNodeCallTest(unittest.TestCase):

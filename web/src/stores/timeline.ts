@@ -15,6 +15,12 @@ import {
 import { cloneClipPipeline, flattenClipPipeline, newClipPipeline, openClipPipeline } from "@/utils/subgraph";
 
 /** 采样流程导出文件标记（导入时校验；与任务导出 `.studio-task.json` 同风格） */
+/** 全局流程库落库防抖：子图编辑器每秒回写一次定义（有变化才写），合并成一次 PUT */
+const PIPELINE_SAVE_DEBOUNCE_MS = 600;
+
+/** 每个 store 实例的流程库防抖计时器（多节点各持一个 pinia，不能共用一个全局计时器） */
+const pipelineSaveTimers = new WeakMap<object, number>();
+
 const PIPELINE_EXPORT_TYPE = "minimax-h3-studio-pipeline";
 const PIPELINE_EXPORT_VERSION = 1;
 
@@ -30,8 +36,8 @@ function createId(): string {
  *  - 键是 taskId 本身：恢复时已经确定要打开哪个任务，不存在张冠李戴。
  *  - 页面刷新/关闭即失效（那时以 DB 为准）。 */
 const SESSION_SNAPSHOT_LIMIT = 20;
-/** 会话内时间线快照：payload + 采样流程库（库不进 StudioPayload，但兜底恢复时要一起留着） */
-type TimelineSnapshot = StudioPayload & { pipelines?: PipelineLibraryEntry[] };
+/** 会话内时间线快照：payload（采样流程库已移到全局，不再随任务快照走） */
+type TimelineSnapshot = StudioPayload;
 
 const sessionTimelines = new Map<string, TimelineSnapshot>();
 
@@ -61,8 +67,12 @@ function fetchApi(url: string, init?: RequestInit): Promise<Response> {
 export const useTimelineStore = defineStore("timeline", {
   state: () => ({
     clips: [] as Clip[],
-    /** 任务级采样流程库（一份定义可被多张卡片按 pipelineId 引用；随任务时间线存 DB） */
+    /** 全局采样流程库（**跨任务共享**，不属于任何任务；存 DB pipeline_library 表） */
     pipelines: [] as PipelineLibraryEntry[],
+    /** 是否已从服务端拉到全局库：**为真才允许整库回写**（未加载就提交 = 空库覆盖，会删光用户的流程） */
+    pipelinesLoaded: false,
+    /** 上次整库提交是否失败（UI 可提示"改动还在本地"；库是全局资产，失败不能装作成功） */
+    pipelinesSaveFailed: false,
     canvas: {
       fps: 24,
       width: 864,
@@ -182,7 +192,90 @@ export const useTimelineStore = defineStore("timeline", {
       this.clips.splice(toIndex, 0, seg);
     },
 
-    // ---------- 采样流程库（任务级；一份定义可被多张卡片引用） ----------
+    // ---------- 全局采样流程库（跨任务共享；一份定义可被任意任务的多张卡片引用） ----------
+    // 库不属于任务：新建/切换/删除任务都不动它（见 newTask / unloadTask）。
+    // 唯一真相在后端全局表，这里的内存副本经 loadPipelines 拉取、savePipelines 整库提交。
+
+    /** 从后端加载全局流程库（幂等；force=true 强制刷新）。
+     *  节点挂载时调用一次——流程库与任务无关，没加载任务也能用。 */
+    async loadPipelines(force = false): Promise<boolean> {
+      if (this.pipelinesLoaded && !force) return true;
+      try {
+        const res = await fetchApi("/minimax/studio/pipelines");
+        if (!res.ok) return false;
+        const data = (await res.json()) as { pipelines?: unknown };
+        const list = Array.isArray(data?.pipelines) ? data.pipelines : [];
+        this.pipelines = list
+          .filter(
+            (p): p is PipelineLibraryEntry =>
+              !!p &&
+              typeof (p as PipelineLibraryEntry).id === "string" &&
+              typeof (p as PipelineLibraryEntry).def === "object" &&
+              (p as PipelineLibraryEntry).def !== null,
+          )
+          .map((p) => ({ id: p.id, name: String(p.name || "未命名流程"), def: p.def }));
+        this.pipelinesLoaded = true;
+        this.pipelinesSaveFailed = false;
+        return true;
+      } catch {
+        // 读不到就保持「未就绪」：不写库（空库覆盖全局库 = 删光用户的自定义流程）
+        return false;
+      }
+    },
+
+    /** 整库提交到后端（覆盖式：含新建/改名/删除/编辑定义）。
+     *  ★ 未就绪（还没读到库里已有定义）拒绝写库——与 saveToDb 的 I2 守卫同源。 */
+    async savePipelines(): Promise<boolean> {
+      if (!this.pipelinesLoaded) {
+        console.warn(
+          "[StudioConsole] 全局流程库尚未加载完成，本次改动不落库（避免用空库覆盖后端流程库）",
+        );
+        return false;
+      }
+      try {
+        const res = await fetchApi("/minimax/studio/pipelines", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            pipelines: this.pipelines.map((p) => ({ id: p.id, name: p.name, def: p.def })),
+            // 已加载 = 本地就是权威：删到空也是用户的决定，显式确认（后端空覆盖保险）
+            confirm_clear: true,
+          }),
+        });
+        this.pipelinesSaveFailed = !res.ok;
+        if (!res.ok) {
+          console.error(`[StudioConsole] 流程库落库失败（HTTP ${res.status}）：改动仍在本地`);
+        }
+        return res.ok;
+      } catch (err) {
+        this.pipelinesSaveFailed = true;
+        console.error("[StudioConsole] 流程库落库失败（网络异常）：改动仍在本地", err);
+        return false;
+      }
+    },
+
+    /** 防抖落库：子图编辑回写每秒可能触发一次，合并成一次 PUT */
+    schedulePipelineSave(): void {
+      const prev = pipelineSaveTimers.get(this);
+      if (prev) window.clearTimeout(prev);
+      pipelineSaveTimers.set(
+        this,
+        window.setTimeout(() => {
+          pipelineSaveTimers.delete(this);
+          void this.savePipelines();
+        }, PIPELINE_SAVE_DEBOUNCE_MS),
+      );
+    },
+
+    /** 立刻落库（不等防抖）：改完名字/删完/切任务/节点销毁前调用 */
+    flushPipelineSave(): void {
+      const prev = pipelineSaveTimers.get(this);
+      if (prev) {
+        window.clearTimeout(prev);
+        pipelineSaveTimers.delete(this);
+      }
+      void this.savePipelines();
+    },
 
     /** 生成不与现有流程重名的名称（"X" → "X（2）"） */
     uniquePipelineName(base: string): string {
@@ -199,7 +292,7 @@ export const useTimelineStore = defineStore("timeline", {
     createPipeline(label = ""): PipelineLibraryEntry {
       const entry = newClipPipeline(this.uniquePipelineName(label || `流程 ${this.pipelines.length + 1}`));
       this.pipelines.push(entry);
-      void this.saveToDb();
+      this.flushPipelineSave(); // 新建是低频动作，立刻落库（全局库，与任务无关）
       return entry;
     },
 
@@ -255,7 +348,7 @@ export const useTimelineStore = defineStore("timeline", {
       // 新 id（copy 内会 JSON 深拷贝并改写 def 里的 id/name），避免与现有流程撞 id / 子图冲突
       const entry = cloneClipPipeline({ id: "", name, def: obj.def }, name);
       this.pipelines.push(entry);
-      void this.saveToDb();
+      this.flushPipelineSave();
       return { ok: true, message: `已导入流程：${entry.name}` };
     },
 
@@ -264,6 +357,7 @@ export const useTimelineStore = defineStore("timeline", {
       const entry = this.pipelines.find((p) => p.id === id);
       if (!entry) return;
       entry.def = def;
+      this.schedulePipelineSave(); // 子图编辑每秒可能回写一次 → 防抖合并
     },
 
     renamePipeline(id: string, name: string): void {
@@ -271,6 +365,7 @@ export const useTimelineStore = defineStore("timeline", {
       const trimmed = name.trim();
       if (!entry || !trimmed || entry.name === trimmed) return;
       entry.name = trimmed;
+      this.flushPipelineSave();
     },
 
     /** 复制为新流程（要独立改一份时的出口：新 id + 内容照抄） */
@@ -279,6 +374,7 @@ export const useTimelineStore = defineStore("timeline", {
       if (!src) return null;
       const copy = cloneClipPipeline(src, `${src.name} 副本`);
       this.pipelines.push(copy);
+      this.flushPipelineSave();
       return copy;
     },
 
@@ -290,6 +386,7 @@ export const useTimelineStore = defineStore("timeline", {
       const idx = this.pipelines.findIndex((p) => p.id === id);
       if (idx === -1) return 0;
       this.pipelines.splice(idx, 1);
+      this.flushPipelineSave();
       let affected = 0;
       for (const seg of this.clips) {
         if (seg.pipelineId === id) {
@@ -407,7 +504,7 @@ export const useTimelineStore = defineStore("timeline", {
     /** 新建空任务（清空当前时间线并创建新任务记录），创建后立即落库 */
     async newTask(nodeId: string, name = ""): Promise<string | null> {
       this.clips = [];
-      this.pipelines = [];
+      // 全局采样流程库不随任务走：新建任务不动它
       this.canvas = { fps: 24, width: 864, height: 480 };
       this.selectedId = null;
       this.historyByClipId = {}; // 新任务无历史
@@ -424,7 +521,6 @@ export const useTimelineStore = defineStore("timeline", {
      *  bindingReleased=true 是**唯一**允许清空工作流载体的信号（I1 载体侧）。 */
     unloadTask(): void {
       this.clips = [];
-      this.pipelines = [];
       this.canvas = { fps: 24, width: 864, height: 480 };
       this.selectedId = null;
       this.taskId = null;
@@ -478,8 +574,6 @@ export const useTimelineStore = defineStore("timeline", {
       let seq: {
         canvas?: CanvasConfig;
         clips?: Record<string, unknown>[];
-        /** 任务级采样流程库（引用模型：片段只存 pipelineId） */
-        pipelines?: PipelineLibraryEntry[];
       } = {};
       try {
         seq = JSON.parse(data.timeline || "{}");
@@ -489,14 +583,8 @@ export const useTimelineStore = defineStore("timeline", {
 
       const rows = seq.clips ?? [];
       const incoming = rows.map((c) => fromClipPayload(c as unknown as ClipPayload));
-      // 流程库：新版直接读 `pipelines`；旧数据把定义内联在 clips[].pipeline.def 里
-      //   → 收编进库（引用 model 之前的数据无需手工迁移）。
-      const library: PipelineLibraryEntry[] = Array.isArray(seq.pipelines)
-        ? seq.pipelines.filter((p) => p && typeof p.id === "string")
-        : [];
-      for (const legacy of legacyPipelinesFromRows(rows)) {
-        if (!library.some((p) => p.id === legacy.id)) library.push(legacy);
-      }
+      // 采样流程定义住在**全局库**（pipeline_library，跨任务共享），不随任务走；
+      // 历史数据里内联的 timeline.pipelines 由后端一次性迁移收编（见 segment_cache）。
       // 兜底来源优先级：本地已就绪的同任务内容 > 本会话快照
       const localReady = this.loadedTaskId === taskId && this.clips.length > 0;
       const cached = sessionTimelineOf(taskId);
@@ -505,10 +593,6 @@ export const useTimelineStore = defineStore("timeline", {
         if (seq.canvas) this.canvas = { ...seq.canvas };
         else if (!localReady && cached) this.canvas = { ...cached.canvas };
         this.clips = fallback;
-        // 流程库：本地已就绪优先保留本地；否则用会话快照里的库（都没有就只能是空的）
-        if (!localReady && cached?.pipelines?.length) {
-          this.pipelines = cached.pipelines.map((p) => ({ id: p.id, name: p.name, def: p.def }));
-        }
         this.selectedId = this.clips[0]?.id ?? null;
         this.taskId = taskId;
         this.loadedTaskId = taskId;
@@ -524,7 +608,6 @@ export const useTimelineStore = defineStore("timeline", {
       if (seq.canvas) this.canvas = { ...seq.canvas };
       // 直接恢复每 clip 的当前参数草稿（timeline 是权威，不指向历史）
       this.clips = incoming;
-      this.pipelines = library;
       this.selectedId = this.clips[0]?.id ?? null;
       this.taskId = taskId;
       this.loadedTaskId = taskId;
@@ -816,22 +899,20 @@ export const useTimelineStore = defineStore("timeline", {
     async saveToDb(): Promise<boolean> {
       if (!this.taskId) return false;
       if (this.loadedTaskId !== this.taskId) return false; // 恢复未完成：拒绝写库（防空覆盖）
-      // 时间线当前数据 = canvas + clips（含流程引用）+ 采样流程库（定义的唯一真相）；
-      // 摊平图是派生物（发 payload 时才生成），不落库。
+      // 时间线当前数据 = canvas + clips（含流程引用）；流程定义住在**全局库**
+      // （pipeline_library，跨任务共享），不随任务落库——避免两处真相。
+      // 摊平图是派生物（发 payload 时才生成），同样不落库。
       const seq = {
         version: 1,
         canvas: { ...this.canvas },
         clips: this.clips.map((c) => toClipDbRow(c)),
-        pipelines: this.pipelines.map((p) => ({ id: p.id, name: p.name, def: p.def })),
         totalDurationSec: this.totalDurationSec,
       };
-      // 会话内快照：先记后发 —— 写库失败/被清空时仍能兜底恢复（I1 的内存侧）；
-      // 流程库也一起记（库不在 StudioPayload 里，兜底恢复缺它就全变默认流程）
+      // 会话内快照：先记后发 —— 写库失败/被清空时仍能兜底恢复（I1 的内存侧）
       rememberSessionTimeline(this.taskId, {
         version: 1,
         canvas: { ...this.canvas },
         clips: this.clips.map((c) => toClipDbRow(c) as unknown as ClipPayload),
-        pipelines: this.pipelines.map((p) => ({ id: p.id, name: p.name, def: p.def })),
         totalDurationSec: this.totalDurationSec,
       });
       try {
@@ -954,7 +1035,7 @@ function clipBaseFields(s: Clip): Omit<ClipPayload, "pipeline"> {
 }
 
 /**
- * DB 草稿行：**只存引用**（`pipelineId`），定义在流程库（`pipelines`）里一处；
+ * DB 草稿行：**只存引用**（`pipelineId`），定义在**全局库**（pipeline_library 表）里一处；
  * 摊平图是派生物，绝不落草稿。
  */
 function toClipDbRow(s: Clip): Record<string, unknown> {
@@ -1022,20 +1103,6 @@ function fromClipPayload(s: ClipPayload & { pipelineId?: string | null }): Clip 
     ...(s.refAudios?.length ? { refAudios: s.refAudios.map(fromMediaPayload) } : {}),
     ...(s.sourceVideo ? { sourceVideo: fromMediaPayload(s.sourceVideo) } : {}),
   };
-}
-
-/** 从 DB 行里捞出旧的内联流程定义（迁移用；返回去重后的条目） */
-function legacyPipelinesFromRows(rows: Record<string, unknown>[]): PipelineLibraryEntry[] {
-  const out: PipelineLibraryEntry[] = [];
-  const seen = new Set<string>();
-  for (const row of rows) {
-    const inline = (row as { pipeline?: { id?: string; name?: string; def?: unknown } }).pipeline;
-    const id = inline?.id ? String(inline.id) : "";
-    if (!id || seen.has(id) || inline?.def === undefined) continue;
-    seen.add(id);
-    out.push({ id, name: String(inline.name || `流程 ${out.length + 1}`), def: inline.def });
-  }
-  return out;
 }
 
 /** 画面语义快照 → 片段当前内容。执行态/编排（enabled/continuity）与锁定（sampleFp）保持不动

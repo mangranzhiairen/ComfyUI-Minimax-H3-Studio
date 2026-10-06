@@ -59,6 +59,8 @@ const state = {
   hist: new Map<string, ClipHist>(),
   /** 上传到 "input 目录" 的文件：filename -> Buffer + mime（/upload 写入，/view 读取） */
   input: new Map<string, { data: Buffer; mime: string; kind: string }>(),
+  /** 全局采样流程库（跨任务共享，不属于任何任务；与后端 pipeline_library 表同语义） */
+  pipelines: [] as { id: string; name: string; def: unknown }[],
   seq: 1,
   verSeq: 1000,
 };
@@ -201,6 +203,10 @@ type Handler = (params: string[], req: Req, res: Res, url: URL) => Promise<void>
 
 const routeHandlers: { method: string; re: RegExp; handle: Handler }[] = [];
 
+/** 插件版本：路由表在**模块级**先行注册（下面的 route("/version", …) 读的就是它），
+ *  而版本由 vite.config.ts 在挂载插件时传入，所以先放一个模块级变量再由工厂注入。 */
+let injectedPluginVersion = "0.0.0";
+
 function route(method: string, pattern: string, handle: Handler): void {
   const re = new RegExp(
     "^" + pattern.replace(/\/+/g, "/").replace(/:\w+/g, "([^/]+)") + "$",
@@ -211,7 +217,7 @@ function route(method: string, pattern: string, handle: Handler): void {
 // ---- 任务库 ----
 
 route("GET", "/minimax/studio/version", async (_p, _req, res) => {
-  json(res, 200, { version: pluginVersion });
+  json(res, 200, { version: injectedPluginVersion });
 });
 
 route("POST", "/minimax/studio/tasks", async (_p, req, res) => {
@@ -287,6 +293,25 @@ route("PUT", "/minimax/studio/tasks/:task_id/timeline", async ([taskId], req, re
   json(res, 200, { ok: true });
 });
 
+// ---- 全局采样流程库（跨任务共享，不属于任何任务） ----
+
+route("GET", "/minimax/studio/pipelines", async (_p, _req, res) => {
+  json(res, 200, { pipelines: state.pipelines });
+});
+
+route("PUT", "/minimax/studio/pipelines", async (_p, req, res) => {
+  const b = JSON.parse((await bodyText(req)) || "{}");
+  const list = Array.isArray(b?.pipelines) ? b.pipelines : [];
+  state.pipelines = list.filter(
+    (p: unknown): p is { id: string; name: string; def: unknown } =>
+      !!p &&
+      typeof (p as { id?: unknown }).id === "string" &&
+      typeof (p as { def?: unknown }).def === "object" &&
+      (p as { def?: unknown }).def !== null,
+  );
+  json(res, 200, { ok: true, count: state.pipelines.length });
+});
+
 route("PUT", "/minimax/studio/tasks/:task_id/name", async ([taskId], req, res) => {
   const t = state.tasks.get(taskId);
   if (!t) return json(res, 404, { error: `任务不存在: ${taskId}` });
@@ -352,11 +377,19 @@ route("GET", "/minimax/studio/tasks/:task_id/export", async ([taskId], _req, res
       samples: h[clipId].samples.map((s) => ({ versionId: s.versionId, contentFp: s.contentFp, canvas: s.canvas, sampleFp: s.sampleFp, seed: s.seed, durationSec: s.durationSec, continuity: s.continuity, frames: s.frames, sampleLen: s.sampleLen, createdAt: s.createdAt })),
     };
   }
+  const timeline = safeParse(t.timeline) as { clips?: { pipelineId?: string }[] };
+  const refIds = new Set(
+    (Array.isArray(timeline.clips) ? timeline.clips : [])
+      .map((c) => String(c?.pipelineId || ""))
+      .filter(Boolean),
+  );
   json(res, 200, {
     type: "minimax-h3-studio-task",
     version: 1,
     name: t.name,
-    timeline: safeParse(t.timeline),
+    timeline,
+    // 被引用的全局流程定义：导入方按 id 并入自己的库（与后端 export_task 同语义）
+    pipelines: state.pipelines.filter((p) => refIds.has(p.id)),
     history,
   });
 });
@@ -384,6 +417,17 @@ route("POST", "/minimax/studio/tasks/import", async (_p, req, res) => {
     updated_at: Date.now() / 1000,
   };
   state.tasks.set(id, task);
+  // 导出文件内嵌的全局流程定义 → 按 id 并入全局库（与后端 import_task 同语义）
+  const incoming = (data as { pipelines?: unknown }).pipelines;
+  if (Array.isArray(incoming)) {
+    for (const p of incoming) {
+      const pid = String((p as { id?: unknown })?.id || "");
+      const def = (p as { def?: unknown })?.def;
+      if (!pid || !def || typeof def !== "object") continue;
+      if (state.pipelines.some((x) => x.id === pid)) continue; // 已存在的 id 保留本地那份
+      state.pipelines.push({ id: pid, name: String((p as { name?: unknown }).name || "导入的流程"), def });
+    }
+  }
   const histSrc = (data as { history?: Record<string, { versions?: Record<string, unknown>[]; samples?: Record<string, unknown>[] }> }).history || {};
   const hist: ClipHist = {};
   for (const clipId of Object.keys(histSrc)) {
@@ -647,6 +691,7 @@ function serveView(res: Res, url: URL): void {
  *   多级相对路径会静默解析到错误位置。统一由调用方传入。
  */
 export function minimaxStudioDevMock(pluginVersion = "0.0.0"): Plugin {
+  injectedPluginVersion = pluginVersion;
   return {
     name: "minimax-h3-studio-dev-mock",
     configureServer(server) {

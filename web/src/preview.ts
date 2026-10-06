@@ -34,6 +34,8 @@ async function bootstrap() {
   app.mount("#app");
 
   const store = useTimelineStore();
+  // 全局流程库与任务无关：演示态也先拉一次，卡片上的 pipelineId 才解析得到
+  void store.loadPipelines();
 
   // 加载演示任务（从 mock DB 恢复 timeline，走与 ComfyUI 相同的 loadTask 链路）
   if (demoTaskId) {

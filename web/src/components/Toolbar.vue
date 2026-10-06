@@ -123,7 +123,7 @@ async function refreshTasks() {
   }));
 }
 
-// ---------- 采样流程库（工具栏统一管理：新建/编辑/重命名/复制/删除 + 导入导出） ----------
+// ---------- 采样流程库（**全局，跨任务共享**；工具栏统一管理：新建/编辑/重命名/复制/删除 + 导入导出） ----------
 // 片段上的 ⊞ 下拉只负责**选择**（默认官方 / 库里某一份）；这里管流程本身。
 
 const showPipelineManager = ref(false);
@@ -164,7 +164,6 @@ function confirmRenamePipeline() {
   const name = pipelineNameInput.value.trim();
   if (id && name) store.renamePipeline(id, store.uniquePipelineName(name));
   renamingPipelineId.value = null;
-  void store.saveToDb();
 }
 
 function onDuplicatePipeline(id: string) {
@@ -192,8 +191,8 @@ function confirmDeletePipeline() {
   const entry = deletingPipeline.value;
   deletingPipelineId.value = null;
   if (!entry) return;
-  const affected = store.deletePipeline(entry.id);
-  void store.saveToDb();
+  const affected = store.deletePipeline(entry.id); // 内部已 flush 全局库落库
+  void store.saveToDb(); // 引用它的卡片被解绑（pipelineId 清除）→ 时间线也要落库
   message.warning(
     affected > 0
       ? `已删除流程「${entry.name}」，${affected} 张卡片回到默认官方流程`
@@ -492,7 +491,7 @@ function patchCanvas(p: Record<string, number>) {
         @click="store.openRestoreModal()"
       ><TbIcon name="history" /> 恢复片段</button>
 
-      <!-- 采样流程库：新建/编辑/重命名/复制/删除 + 导入导出
+      <!-- 采样流程库（全局，跨任务共享）：新建/编辑/重命名/复制/删除 + 导入导出
            （片段的流程选择在卡片 ⊞ 下拉里） -->
       <n-popover
         v-model:show="showPipelineManager"
@@ -503,18 +502,18 @@ function patchCanvas(p: Record<string, number>) {
         <template #trigger>
           <button
             class="tb-btn ghost"
-            :title="`自定义采样流程（${store.pipelines.length} 份）：新建/编辑/导入导出；片段上点 ⊞ 选用`"
+            :title="`自定义采样流程（全局库，${store.pipelines.length} 份，跨任务共享）：新建/编辑/导入导出/一键挂到所有卡片；片段上点 ⊞ 单独选用`"
           ><TbIcon name="layers" /> 自定义采样流程{{ store.pipelines.length ? ` ${store.pipelines.length}` : "" }}</button>
         </template>
 
         <div class="pl-panel">
           <div class="pl-head">
             自定义采样流程
-            <span class="pl-hint">片段上点 ⊞ 选择，「全用」挂到所有卡片</span>
+            <span class="pl-hint">全局库（跨任务共享）；片段上点 ⊞ 选择，「全用」挂到所有卡片</span>
           </div>
 
           <div v-if="!store.pipelines.length" class="pl-empty">
-            还没有流程 —— 点「＋ 新建流程」搭一份，或「导入…」用别人分享的
+            全局库还没有流程 —— 点「＋ 新建流程」搭一份，或「导入…」用别人分享的
           </div>
 
           <div v-else class="pl-list">
@@ -631,9 +630,9 @@ function patchCanvas(p: Record<string, number>) {
       :show="!!deletingPipelineId"
       preset="dialog"
       title="删除自定义采样流程"
-      :content="`将删除流程「${deletingPipeline?.name ?? ''}」的定义（${
+      :content="`将删除全局流程「${deletingPipeline?.name ?? ''}」的定义（${
         deletingPipeline ? store.pipelineUsage(deletingPipeline.id) : 0
-      } 张卡片正在引用），这些片段会回到默认官方采样流程。不可恢复。确定删除？`"
+      } 张本任务的卡片正在引用），本任务及其他任务里引用它的片段都会回到默认官方采样流程。不可恢复。确定删除？`"
       positive-text="删除"
       negative-text="取消"
       @positive-click="confirmDeletePipeline"

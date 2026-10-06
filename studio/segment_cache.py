@@ -23,7 +23,9 @@ import hashlib
 import json
 import logging
 import sqlite3
+import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -126,96 +128,385 @@ def preview_url(node_id: str, sample_fp: str) -> str:
 
 # ---------- SQLite ----------
 
+# 表结构版本（PRAGMA user_version）：记录这一份库经历过哪些演进步骤。
+# 取代早期的"结构不符 → 删库重建"——库是用户资产，只允许就地升级。
+# 2 = 只增不减的结构演进基建；3 = + pipeline_library（全局采样流程库）+ 内联流程收编
+_SCHEMA_VERSION = 3
+
+# 建表 DDL（幂等）。init_db() 每次都执行一遍：缺表就地补表，缺列就地补列。
+_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS tasks (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    node_id      TEXT,
+    name         TEXT DEFAULT '',
+    -- 时间线当前数据：{version, canvas, clips:[{clipId, enabled, 当前参数草稿...}]}
+    timeline     TEXT,
+    sampling_json TEXT,
+    status       TEXT,
+    created_at   REAL,
+    updated_at   REAL
+);
+-- 片段版本（纯 Model）：采样固化的参数快照，不可变；同内容复用
+CREATE TABLE IF NOT EXISTS clip_versions (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id      INTEGER,
+    clip_id      TEXT,
+    content_fp   TEXT,
+    -- 采样时的画布（"{width}x{height}@{fps}"，任务级分辨率，用于按分辨率分组展示）
+    canvas       TEXT,
+    -- 参数快照 JSON（前端契约同构，恢复编辑面板用）
+    snapshot     TEXT,
+    created_at   REAL
+);
+-- 采样历史：挂在版本上（version_id）。样本携带「当时怎么拍的规格」：
+-- 画布 canvas + 时长 duration_sec（锁定出片时据此恢复任务分辨率与片段时长）；
+-- seed 保留作抽卡标识（并参与缓存命中）。采样工艺（steps/sampler/cfg 等）
+-- 不记录——无法从 latent 恢复，展示无意义。
+CREATE TABLE IF NOT EXISTS version_samples (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id      INTEGER,
+    clip_id      TEXT,
+    version_id   INTEGER,
+    content_fp   TEXT,
+    canvas       TEXT,
+    sample_fp    TEXT,
+    seed         INTEGER,
+    duration_sec REAL,
+    continuity   INTEGER,
+    frames       INTEGER,
+    sample_len   INTEGER,
+    created_at   REAL,
+    UNIQUE (task_id, clip_id, sample_fp)
+);
+-- 全局采样流程库（**跨任务共享**，不属于任何任务）：片段只存 pipelineId 引用，
+-- 新建/切换/删除任务都不动它（规格见 AGENT.md）。def = 子图定义 JSON。
+CREATE TABLE IF NOT EXISTS pipeline_library (
+    id         TEXT PRIMARY KEY,
+    name       TEXT DEFAULT '',
+    def        TEXT,
+    updated_at REAL
+);
+"""
+
+# 补列清单（键=列名，值=ALTER TABLE ADD COLUMN 用的列定义；主键 id 不在此列）。
+# 与 _SCHEMA_SQL 一一对应：**新增列时两处都要加**，已有库靠这里幂等补齐。
+_SCHEMA_COLUMNS: dict[str, dict[str, str]] = {
+    "tasks": {
+        "node_id": "TEXT",
+        "name": "TEXT DEFAULT ''",
+        "timeline": "TEXT",
+        "sampling_json": "TEXT",
+        "status": "TEXT",
+        "created_at": "REAL",
+        "updated_at": "REAL",
+    },
+    "clip_versions": {
+        "task_id": "INTEGER",
+        "clip_id": "TEXT",
+        "content_fp": "TEXT",
+        "canvas": "TEXT",
+        "snapshot": "TEXT",
+        "created_at": "REAL",
+    },
+    "version_samples": {
+        "task_id": "INTEGER",
+        "clip_id": "TEXT",
+        "version_id": "INTEGER",
+        "content_fp": "TEXT",
+        "canvas": "TEXT",
+        "sample_fp": "TEXT",
+        "seed": "INTEGER",
+        "duration_sec": "REAL",
+        "continuity": "INTEGER",
+        "frames": "INTEGER",
+        "sample_len": "INTEGER",
+        "created_at": "REAL",
+    },
+    "pipeline_library": {
+        "name": "TEXT DEFAULT ''",
+        "def": "TEXT",
+        "updated_at": "REAL",
+    },
+}
+
+
 def _connect() -> sqlite3.Connection:
     conn = sqlite3.connect(db_path(), timeout=10)
     conn.row_factory = sqlite3.Row
     return conn
 
 
-def init_db() -> None:
-    """初始化数据库：不做版本标记、不做 schema 迁移。
+# 「库已就绪」标记：init_db() 挂在**每个** DB 操作入口上（19 处），必须保证真正的
+# 建表/补列/写 user_version 每个库路径每进程只跑一次——否则每次查询都要跑一遍
+# executescript + 逐表 PRAGMA + ALTER 检查，还会给纯读操作平白加上写锁。
+# key = 库文件路径（测试里换目录、运行中库文件被删掉时自动重新初始化）。
+_schema_ready: set[str] = set()
+_schema_lock = threading.Lock()
 
-    开发期策略：表结构与当前代码不符时，直接删除数据库文件重建
-    （历史任务不迁移——用户已确认放弃旧库兼容）。
+
+def init_db() -> None:
+    """确保任务库可用（首次调用才真正建表/就地升级）。
+
+    **每个库文件路径每进程只真正初始化一次**：各操作入口统一调它是为了免掉
+    "no such table/column"，但除第一次外都只是「命中标记 + 一次 stat」。
+
+    结构演进策略（取代早期的"结构不符 → 删库重建"）：
+    - 库文件不存在 → 按当前定义建全表，并写入 user_version；
+    - 库文件已存在 → 幂等补表（CREATE TABLE IF NOT EXISTS）+ 补列（ALTER TABLE ADD COLUMN），
+      补了什么写进日志；缺哪列补哪列，既有数据一律不动；
+    - 库文件损坏/不是 SQLite → **报错但不删除**，由用户备份后自行处理。
+
+    演进步骤请同时更新 _SCHEMA_VERSION / _SCHEMA_SQL / _SCHEMA_COLUMNS 三处；
+    不要再引入任何删除数据库文件或删表的分支。
     """
     path = db_path()
+    key = str(path)
+    if key in _schema_ready and path.exists():
+        return
+    with _schema_lock:  # HTTP 线程与采样线程可能同时首次进来
+        if key in _schema_ready and path.exists():
+            return
+        _init_db_once(path)
+        _schema_ready.add(key)
+
+
+def _init_db_once(path: Path) -> None:
+    """真正的初始化：新库建表 / 已有库就地升级（只增不减，绝不删文件）。"""
     if not path.exists():
         _create_schema(path)
         return
     try:
-        with _connect() as conn:
-            # 校验关键结构：clip_versions 的 content_fp/snapshot + version_samples 的 version_id
-            ver_cols = {r[1] for r in conn.execute("PRAGMA table_info(clip_versions)")}
-            if not {"content_fp", "snapshot"} <= ver_cols:
-                raise ValueError("clip_versions 表结构不符")
-            smp_cols = {r[1] for r in conn.execute("PRAGMA table_info(version_samples)")}
-            if "version_id" not in smp_cols or "duration_sec" not in smp_cols:
-                raise ValueError("version_samples 表结构不符")
-    except Exception as exc:  # noqa: BLE001 结构不符/损坏 → 删库重建
-        log.warning("数据库结构不符，删除重建: %s", exc)
+        conn = _connect()
         try:
-            path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        _create_schema(path)
+            changes = _upgrade_schema(conn)
+            conn.commit()
+        finally:
+            conn.close()  # 显式关闭：异常路径也要释放文件句柄（Windows 下会锁库文件）
+    except sqlite3.DatabaseError as exc:
+        # 损坏的库是用户资产：插件绝不代为删除，抛出清晰错误让用户自己备份/修复
+        raise RuntimeError(
+            f"任务数据库无法打开：{path}（{exc}）。插件不会删除它；"
+            "请先备份该文件（或重命名后再启动，让插件另建一份新库）"
+        ) from exc
+    if changes:
+        log.warning("任务库已就地升级（只增不减，未删除任何数据）：%s", "；".join(changes))
 
 
 def _create_schema(path: Path) -> None:
-    """按当前代码建表（无版本标记，结构即最新定义）。
+    """按当前代码建表（只在库文件不存在时调用）并写入结构版本。
 
     MVC 分层：clip_versions / version_samples 是纯 Model（历史版本 + 采样）；
     片段当前数据（草稿）由前端存入 tasks.timeline（时间线当前完整数据），
     与历史解耦（反悔 = 快照复制加载，不指向历史）。
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(path) as conn:
-        conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS tasks (
-                id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                node_id      TEXT,
-                name         TEXT DEFAULT '',
-                -- 时间线当前数据：{version, canvas, clips:[{clipId, enabled, 当前参数草稿...}]}
-                timeline     TEXT,
-                sampling_json TEXT,
-                status       TEXT,
-                created_at   REAL,
-                updated_at   REAL
-            );
-            -- 片段版本（纯 Model）：采样固化的参数快照，不可变；同内容复用
-            CREATE TABLE IF NOT EXISTS clip_versions (
-                id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                task_id      INTEGER,
-                clip_id      TEXT,
-                content_fp   TEXT,
-                -- 采样时的画布（"{width}x{height}@{fps}"，任务级分辨率，用于按分辨率分组展示）
-                canvas       TEXT,
-                -- 参数快照 JSON（前端契约同构，恢复编辑面板用）
-                snapshot     TEXT,
-                created_at   REAL
-            );
-            -- 采样历史：挂在版本上（version_id）。样本携带「当时怎么拍的规格」：
-            -- 画布 canvas + 时长 duration_sec（锁定出片时据此恢复任务分辨率与片段时长）；
-            -- seed 保留作抽卡标识（并参与缓存命中）。采样工艺（steps/sampler/cfg 等）
-            -- 不记录——无法从 latent 恢复，展示无意义。
-            CREATE TABLE IF NOT EXISTS version_samples (
-                id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                task_id      INTEGER,
-                clip_id      TEXT,
-                version_id   INTEGER,
-                content_fp   TEXT,
-                canvas       TEXT,
-                sample_fp    TEXT,
-                seed         INTEGER,
-                duration_sec REAL,
-                continuity   INTEGER,
-                frames       INTEGER,
-                sample_len   INTEGER,
-                created_at   REAL,
-                UNIQUE (task_id, clip_id, sample_fp)
-            );
-            """
+    conn = sqlite3.connect(path)
+    try:
+        conn.executescript(_SCHEMA_SQL)
+        _ensure_columns(conn)  # 防御：新库正常不会有缺列
+        conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+        conn.commit()
+    finally:
+        conn.close()  # 不显式关闭会留住文件句柄（Windows 上表现成"文件被占用"）
+
+
+def _upgrade_schema(conn: sqlite3.Connection) -> list[str]:
+    """幂等补齐表与列（只做加法）+ 按 user_version 跑一次性数据迁移。
+
+    返回人类可读的变更清单，供日志回显。
+    """
+    existing = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    conn.executescript(_SCHEMA_SQL)
+    changes = [f"新建表 {name}" for name in _SCHEMA_COLUMNS if name not in existing]
+    changes += _ensure_columns(conn)
+    version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    if version < _SCHEMA_VERSION:
+        # 一次性数据迁移步骤（每步都要幂等：重跑不产生副作用）
+        changes += _migrate_inline_pipelines(conn)
+    if version != _SCHEMA_VERSION:
+        changes.append(f"结构版本 {version} → {_SCHEMA_VERSION}")
+    conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+    return changes
+
+
+def _ensure_columns(conn: sqlite3.Connection) -> list[str]:
+    """按需补列：缺哪列 ALTER TABLE ADD COLUMN 补哪列（绝不删列/删表）。"""
+    added: list[str] = []
+    for table, columns in _SCHEMA_COLUMNS.items():
+        have = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+        if "id" not in have:
+            raise RuntimeError(f"任务库结构损坏：表 {table} 缺少主键列 id（请备份后手动处理）")
+        for name, ddl in columns.items():
+            if name in have:
+                continue
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+            added.append(f"{table} 补列 {name}")
+    return added
+
+
+# ---------- 全局采样流程库（pipeline_library，跨任务共享） ----------
+# 为什么独立于 tasks.timeline：流程是**可复用的工艺资产**，不属于某条片子。放任务里会
+# 随任务切换消失（用户必须每个任务重建一份），也无法一处改到处生效。因此提到全局表，
+# 片段只保留 pipelineId 引用（引用模型不变，只是库的作用域变成全局）。
+
+
+def _pipeline_rows(entries) -> list[tuple[str, str, str]]:
+    """宽松过滤 + 归一化流程库条目 → [(id, name, def_json), …]（非法条目直接丢弃）。"""
+    rows: list[tuple[str, str, str]] = []
+    seen: set[str] = set()
+    for e in entries or []:
+        if not isinstance(e, dict):
+            continue
+        pid = str(e.get("id") or "").strip()
+        name = str(e.get("name") or "").strip()
+        def_obj = e.get("def")
+        if not pid or not name or not isinstance(def_obj, dict) or pid in seen:
+            continue
+        seen.add(pid)
+        rows.append((pid, name, json.dumps(def_obj, ensure_ascii=False)))
+    return rows
+
+
+def list_pipeline_library() -> list[dict]:
+    """全局流程库全部条目：[{id, name, def}]（def 已解析为对象；坏条目跳过不报错）。"""
+    init_db()
+    out: list[dict] = []
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT id, name, def FROM pipeline_library ORDER BY updated_at DESC, id"
+        ).fetchall()
+    for r in rows:
+        try:
+            def_obj = json.loads(r["def"] or "null")
+        except (TypeError, ValueError):
+            log.warning("流程库条目 %s 的定义不是合法 JSON，已跳过", r["id"])
+            continue
+        if not isinstance(def_obj, dict):
+            continue
+        out.append({"id": str(r["id"]), "name": str(r["name"] or ""), "def": def_obj})
+    return out
+
+
+def save_pipeline_library(entries, confirm_clear: bool = False) -> int:
+    """**覆盖式**保存全局流程库（前端是唯一编辑者：整库提交，含重命名/删除）。
+
+    整库替换在一个事务里完成：要么全部生效，要么原样保留——半更新的库比旧库更糟
+    （出现指向不存在定义的引用）。返回写入条数。
+
+    额外保险：请求为**空**而库里非空时，必须显式 confirm_clear（否则 ValueError → 409）。
+    前端在 pipelinesLoaded 为真之后才提交，正常流程始终带 confirm_clear；这道保险专门
+    拦「还没加载就整库提交」的客户端——那会把用户的全部自定义流程删光。
+    """
+    init_db()
+    rows = _pipeline_rows(entries)
+    now = time.time()
+    with _connect() as conn:
+        existing = int(conn.execute("SELECT COUNT(*) FROM pipeline_library").fetchone()[0])
+        if existing and not rows and not confirm_clear:
+            raise ValueError(f"拒绝用空库覆盖 {existing} 份已有采样流程（缺少 confirm_clear）")
+        conn.execute("DELETE FROM pipeline_library")
+        conn.executemany(
+            "INSERT OR REPLACE INTO pipeline_library (id, name, def, updated_at)"
+            " VALUES (?, ?, ?, ?)",
+            [(pid, name, def_json, now) for pid, name, def_json in rows],
         )
+    return len(rows)
+
+
+def merge_pipeline_library(entries) -> int:
+    """按 id **并入**全局流程库（导入任务文件时用）：已存在的 id 保留库里那份
+    （导入方本地版本为准，避免别人的同名流程覆盖自己的工艺）；新 id 直接入库，
+    重名自动加「（N）」后缀。返回新增条数。
+    """
+    init_db()
+    rows = _pipeline_rows(entries)
+    if not rows:
+        return 0
+    existing = list_pipeline_library()
+    known_ids = {p["id"] for p in existing}
+    used_names = {p["name"] for p in existing}
+    now = time.time()
+    added = 0
+    with _connect() as conn:
+        for pid, name, def_json in rows:
+            if pid in known_ids:
+                continue
+            unique = name
+            i = 2
+            while unique in used_names and i < 1000:
+                unique = f"{name}（{i}）"
+                i += 1
+            conn.execute(
+                "INSERT OR REPLACE INTO pipeline_library (id, name, def, updated_at)"
+                " VALUES (?, ?, ?, ?)",
+                (pid, unique, def_json, now),
+            )
+            known_ids.add(pid)
+            used_names.add(unique)
+            added += 1
+    return added
+
+
+def referenced_pipelines(timeline: dict) -> list[dict]:
+    """时间线草稿里**被引用**的全局流程定义（导出时内嵌，让导入方也能跑同一条链）。
+
+    库是全局的，任务文件本身不含定义；不内嵌的话「导出任务给同事」会全部退回官方流程。
+    """
+    ids: list[str] = []
+    for c in timeline.get("clips") or []:
+        if not isinstance(c, dict):
+            continue
+        pid = str(c.get("pipelineId") or "").strip()
+        if pid and pid not in ids:
+            ids.append(pid)
+    if not ids:
+        return []
+    by_id = {p["id"]: p for p in list_pipeline_library()}
+    return [by_id[i] for i in ids if i in by_id]
+
+
+def _migrate_inline_pipelines(conn: sqlite3.Connection) -> list[str]:
+    """（一次性数据迁移）历史 timeline 内联的流程定义 → 全局库，并从 timeline 删掉该键。
+
+    老版本把定义存在任务里（clips[].pipeline.def 或 timeline.pipelines）；全局化之后定义
+    只住全局库一处。这里把它们收编进库而不是丢掉——前端已不再认 timeline.pipelines，
+    丢了用户就得重建。
+    幂等：跑过一次后 timeline 里不再有 pipelines 键（第二次什么都不做）。撞 id 用
+    INSERT OR IGNORE：本机已有就先到先得，绝不用旧副本覆盖。
+    """
+    moved = 0
+    touched = 0
+    for row in conn.execute("SELECT id, timeline FROM tasks").fetchall():
+        timeline = _safe_json(row["timeline"])
+        entries = timeline.pop("pipelines", None)
+        if not isinstance(entries, list) or not entries:
+            continue
+        now = time.time()
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            pid = str(entry.get("id") or "").strip()
+            if not pid:
+                continue
+            conn.execute(
+                "INSERT OR IGNORE INTO pipeline_library (id, name, def, updated_at)"
+                " VALUES (?, ?, ?, ?)",
+                (
+                    pid,
+                    str(entry.get("name") or ""),
+                    json.dumps(entry.get("def"), ensure_ascii=False),
+                    now,
+                ),
+            )
+            moved += 1
+        conn.execute(
+            "UPDATE tasks SET timeline = ? WHERE id = ?",
+            (json.dumps(timeline, ensure_ascii=False), row["id"]),
+        )
+        touched += 1
+    if not moved:
+        return []
+    return [f"收编 {moved} 份内联采样流程到全局库（涉及 {touched} 个任务）"]
 
 
 def create_task(
@@ -642,9 +933,15 @@ _RUNTIME_SAMPLE_KEYS = {"exists", "previewUrl"}
 
 
 def _strip_sample_locks(timeline: dict) -> dict:
-    """清洗 timeline 草稿：移除 clips 的 sampleFp（锁定指针指向本地 latent 缓存文件，
-    导出不含缓存文件，导入后必然失效；保留会造成卡片"已锁定但文件丢失"卡住）。"""
+    """清洗 timeline 草稿（导出/复制/导入都要过一遍）：
+
+    - 移除 clips 的 sampleFp（锁定指针指向本地 latent 缓存文件，导出不含缓存文件，
+      导入后必然失效；保留会造成卡片"已锁定但文件丢失"卡住）。
+    - 丢弃历史遗留的 `pipelines` 字段：流程定义住在**全局流程库**（pipeline_library），
+      任务时间线里再带一份就是两处真相（导出时另有 `pipelines` 顶层段内嵌被引用的定义）。
+    """
     out = dict(timeline)
+    out.pop("pipelines", None)
     clips = out.get("clips")
     if isinstance(clips, list):
         out["clips"] = [
@@ -652,8 +949,6 @@ def _strip_sample_locks(timeline: dict) -> dict:
             for c in clips
         ]
     return out
-
-
 def export_task(task_id) -> dict | None:
     """导出任务为可移植 JSON：name + timeline 草稿（剥 sampleFp）+ 采样参数 + 历史元数据。
 
@@ -691,6 +986,8 @@ def export_task(task_id) -> dict | None:
         "exportedAt": float(task.get("created_at") or time.time()),
         "name": str(task.get("name") or ""),
         "timeline": _strip_sample_locks(timeline),
+        # 被引用的全局流程定义（导入方并入自己的流程库；空 = 该任务没用自定义流程）
+        "pipelines": referenced_pipelines(timeline),
         "sampling": sampling,
         "history": history,
     }
@@ -701,7 +998,8 @@ def import_task(data: dict, node_id: str) -> int:
 
     校验导出标记后建 tasks 行，再按 clip_id 重建 clip_versions/version_samples
     （version id 重映射；保留原 created_at 使历史顺序一致）。sampleFp 锁定一律剥离
-    （缓存文件不随导出迁移）。返回新 task_id。
+    （缓存文件不随导出迁移）。文件里内嵌的 `pipelines` 按 id 并入**全局流程库**
+    （已存在的 id 保留本地那份），导入后卡片的流程引用即可解析。返回新 task_id。
     """
     init_db()
     if not isinstance(data, dict) or data.get("type") != EXPORT_TYPE:
@@ -712,6 +1010,9 @@ def import_task(data: dict, node_id: str) -> int:
     timeline_json = json.dumps(_strip_sample_locks(timeline_raw), ensure_ascii=False)
     name = str(data.get("name") or "导入任务")[:50]
     sampling = data.get("sampling") if isinstance(data.get("sampling"), dict) else {}
+    # 先并入流程库：时间线里的 pipelineId 引用到 loadTask 时就能解析（顺序无关紧要，
+    # 但先入库语义更顺——库是任务的外部依赖）
+    merge_pipeline_library(data.get("pipelines"))
     tid = create_task(node_id, timeline_json, sampling, status="created", name=name)
 
     history = data.get("history")

@@ -159,6 +159,8 @@ export function createStudioConsole(): StudioConsoleApi {
         "setTaskId",
         "setNodeId",
         "loadTask",
+        "loadPipelines",
+        "savePipelines",
         "createTask",
         "newTask",
         "renameTask",
@@ -522,6 +524,8 @@ app.registerExtension({
       // 任务初始化：widget/properties 已有 taskId（工作流恢复）→ 用之；
       // 无 → 不创建（待加载界面，需用户先新建/加载任务才能编辑保存）
       store.setNodeId(String(node.id));
+      // 全局采样流程库（跨任务共享）：与任务无关，挂载即拉一次；拉成功后才允许整库回写
+      void store.loadPipelines();
       // node.id 在创建早期可能是临时值 -1（真实 id 由 ComfyUI 后续分配）：
       // 延迟校准，保证任务记录/事件绑定的 node_id 正确
       if (node.id === -1) {
@@ -573,7 +577,6 @@ app.registerExtension({
       const w = node.widgets?.find((x) => x.name === name);
       if (w && typeof w.value !== "string") w.value = def;
     }
-
     // 恢复时间线 UI（任务库模式）：widget.value 存 {taskId}，按 id 从 DB 加载。
     // 时间线唯一数据源在 SQLite——绝不把时间线写进工作流 json。
     // 统一走 nodeCreated 注册的 tryRestore（双载体 + 幂等 + 失败重试 + 绝不清空）：

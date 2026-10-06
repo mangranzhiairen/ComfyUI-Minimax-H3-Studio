@@ -197,7 +197,7 @@ onBeforeUnmount(() => {
   uninstallDocClose();
   stopPlayer();
   resizeObserver?.disconnect();
-  // 卡片卸载 = 切工作流 tab 销毁节点：把子图最后一次编辑补写进草稿（否则可能丢最后一次改动）
+  // 卡片卸载 = 切工作流 tab 销毁节点：把子图最后一次编辑补写进全局流程库（否则可能丢最后一次改动）
   flushClipPipelineSync();
 });
 
@@ -227,8 +227,8 @@ const sampleCount = computed(
 );
 const showDeleteConfirm = ref(false);
 
-// ---------- 采样流程（任务级流程库 + 片段级引用） ----------
-// 卡片上的 ⊞ 只做**选择**：默认官方流程 / 流程库里的条目（选择即绑定，不打开子图）。
+// ---------- 采样流程（全局流程库 + 片段级引用） ----------
+// 卡片上的 ⊞ 只做**选择**：默认官方流程 / 全局库里的条目（选择即绑定，不打开子图）。
 // 流程本身的新建/编辑/重命名/复制/删除/导入导出都在工具栏「采样流程库」里。
 
 /** 该卡片当前生效的流程（null = 内置官方流程） */
@@ -258,7 +258,7 @@ const pipelineMenuOptions = computed(() => {
 
 const pipelineButtonTitle = computed(() => {
   if (pipelineDangling.value) return "引用的采样流程已不存在（按默认官方流程执行）——点击选择";
-  if (activePipeline.value) return `采样流程：${activePipeline.value.name}（点击切换；流程库在工具栏）`;
+  if (activePipeline.value) return `采样流程：${activePipeline.value.name}（全局库；点击切换，库在工具栏）`;
   return "采样流程：默认官方（点击选择；流程库在工具栏）";
 });
 
