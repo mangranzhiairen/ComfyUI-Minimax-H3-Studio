@@ -5,6 +5,16 @@
 音频同样从 latent 直接切尾部。采样长度 = 可见帧 + 上下文帧（网格对齐），
 解码后裁掉钉入的前缀（trim）。
 
+**钉入内容的网格 = 当级采样的网格**：条件行是按 patch 贴到采样画布上的，尺寸必须与
+"正在被采样的那张 latent"一致。单级流程里两者天然一致；但采样流程（子图）可以在中途
+放大 latent（二采），那时第二级采样换了画布，而钉入内容是在跑图前按第一级画布做好的
+→ 贴不上（core 报 shape mismatch）。
+
+因此钉入时**保留原始块**（FIT_SOURCE_KEY），并由 install_cond_grid_fit() 在
+MiniMaxH3.extra_conds 编码条件之前（每级采样一次，参数里正好带着当级 latent_shapes）
+按当级网格重缩一次：第一级缩到目标网格，第二级若是原生网格则原样使用（零重采样，
+不会因为"先缩后放"而变糊）。
+
 实现思路参考 NikoDemon80 的 ComfyUI-H3-Motion-Context 项目（致谢见 README，
 该项目为 GPL-3.0；本仓库整体亦以 GPL-3.0 发布，见仓库根 LICENSE）。
 """
@@ -22,6 +32,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 
 import torch
 
@@ -41,6 +52,16 @@ DEFAULT_CONTEXT_FRAMES = 22
 DEFAULT_AUDIO_CONTEXT_FRAMES = 24
 # 可选 pin 窗口（必须能拆成整数 latent steps）
 VIDEO_RUN_GRID = (124, 107, 90, 73, 56, 39, 22, 5, 1)
+
+# 钉入条目里的两个簿记键（见 fit_cond_video_latents）：
+#   FIT_SOURCE_KEY —— 上一段的**原始块**，按级缩放永远从它出发
+#   FIT_TAG_KEY    —— 当前 latent 是按哪个网格得到的，用来跳过本级的重复缩放
+FIT_SOURCE_KEY = "_studio_grid_source"
+FIT_TAG_KEY = "_studio_grid_fit"
+# 按级缩放时打印过的网格（避免正/负条件各打一遍）
+_FIT_LOGGED: set[tuple[int, int, int, int]] = set()
+_GRID_FIT_LOCK = threading.Lock()
+_GRID_FIT_STATE: dict = {"depth": 0, "cls": None, "orig": None, "patched": None}
 
 
 def snap_context_frames(raw: int | float | None) -> int:
@@ -145,6 +166,169 @@ def _audio_tail_from_latent(latent: dict, a_frames: int) -> tuple[torch.Tensor, 
     return audio[:1, ..., total_t - rt :].clone(), rt
 
 
+def _latent_hw(tensor) -> tuple[int, int] | None:
+    """视频 latent 的空间网格 (H, W)（latent 单位）。"""
+    if not torch.is_tensor(tensor) or tensor.ndim < 4:
+        return None
+    return int(tensor.shape[-2]), int(tensor.shape[-1])
+
+
+def _fit_video_latent(tensor, dst_h: int, dst_w: int):
+    """把视频 latent 缩到目标网格；已经一致时原样返回（零拷贝）。"""
+    if _latent_hw(tensor) == (int(dst_h), int(dst_w)):
+        return tensor
+    from .context_conform import resize_video_latent
+
+    return resize_video_latent(tensor, int(dst_h), int(dst_w))
+
+
+def fit_cond_video_latents(kwargs: dict, latent_shapes) -> dict:
+    """把 conditioning 里的视频 latent 缩到**当级采样**的网格（每级一次）。
+
+    在 MiniMaxH3.extra_conds 编码条件之前调用：那一刻条件才真正变成条件行，而参数里
+    正好带着当级的 latent_shapes（comfy/samplers.py: process_conds → encode_model_conds
+    → extra_conds）。keyframes 从 FIT_SOURCE_KEY 保存的原始块出发缩放（图里放大过时，
+    第二级若正好是原生网格就是零重采样）；用户自带的锚点/参考图没有原始块，就从当前值
+    缩一次（条件本身不被就地改写，所以每一级都从同一份出发，可重复）。
+    """
+    try:
+        shapes = list(latent_shapes or [])
+        vs = shapes[0] if shapes else None
+        if vs is None:
+            return kwargs
+        dst_h, dst_w = int(vs[-2]), int(vs[-1])
+        if dst_h < 1 or dst_w < 1:
+            return kwargs
+    except Exception:  # noqa: BLE001 形状不可读就完全不插手
+        return kwargs
+
+    out = kwargs
+    for key in ("minimax_keyframes", "minimax_refs"):
+        items = kwargs.get(key)
+        if not isinstance(items, list) or not items:
+            continue
+        key_changed = False
+        new_items: list = []
+        for item in items:
+            if not isinstance(item, dict):
+                new_items.append(item)
+                continue
+            current = item.get("latent")
+            if not torch.is_tensor(current):
+                new_items.append(item)
+                continue
+            target = (dst_h, dst_w)
+            if item.get(FIT_TAG_KEY) == target:
+                # 本级已经按这个网格缩过（钉入时那份静态兜底也带标记）
+                new_items.append(item)
+                continue
+            source = item.get(FIT_SOURCE_KEY)
+            base = source if torch.is_tensor(source) else current
+            src_hw = _latent_hw(base)
+            fitted = dict(item)
+            # 原件网格 == 目标网格时**原样用**（图里放大后第二级正好是原生网格，零重采样）
+            fitted["latent"] = _fit_video_latent(base, dst_h, dst_w)
+            fitted[FIT_TAG_KEY] = target
+            new_items.append(fitted)
+            key_changed = True
+            sig = (
+                int(src_hw[0]) if src_hw else -1,
+                int(src_hw[1]) if src_hw else -1,
+                dst_h,
+                dst_w,
+            )
+            if sig not in _FIT_LOGGED:
+                _FIT_LOGGED.add(sig)
+                same_grid = src_hw == target
+                log.info(
+                    "段间续接: 本级采样网格 %dx%d ← 钉入内容 %dx%d（%s，%s）",
+                    dst_h, dst_w,
+                    int(src_hw[0]) if src_hw else -1, int(src_hw[1]) if src_hw else -1,
+                    "原生网格，原样使用" if same_grid else "按级缩放",
+                    key,
+                )
+        if key_changed:
+            if out is kwargs:
+                out = dict(kwargs)
+            out[key] = new_items
+    return out
+
+
+def _patch_target_class(model):
+    """从 model（ModelPatcher / BaseModel 实例 / 类）找出真正定义了 extra_conds 的类。"""
+    for candidate in (
+        model,
+        getattr(model, "model", None),
+        getattr(getattr(model, "model", None), "model", None),
+    ):
+        if candidate is None:
+            continue
+        cls = candidate if isinstance(candidate, type) else type(candidate)
+        if hasattr(cls, "extra_conds"):
+            return cls
+    return None
+
+
+def install_cond_grid_fit(model) -> bool:
+    """临时让模型类的 extra_conds 在编码条件前按当级网格重缩视频 latent。
+
+    只在跑续接采样期间生效，uninstall_cond_grid_fit() 会恢复原方法；网格一致时是 no-op。
+    返回是否装上（装不上时行为退回"钉入时按本段网格缩一次"的静态兜底）。
+    """
+    cls = _patch_target_class(model)
+    if cls is None:
+        return False
+    with _GRID_FIT_LOCK:
+        if _GRID_FIT_STATE["depth"] > 0:
+            _GRID_FIT_STATE["depth"] += 1
+            return True
+        orig = getattr(cls, "extra_conds", None)
+        if orig is None:
+            return False
+
+        def _patched(self, **kwargs):
+            try:
+                kwargs = fit_cond_video_latents(kwargs, kwargs.get("latent_shapes"))
+            except Exception:  # noqa: BLE001 缩放失败不能阻断采样
+                log.debug("段间续接: 按级网格缩放跳过", exc_info=True)
+            return orig(self, **kwargs)
+
+        try:
+            cls.extra_conds = _patched  # type: ignore[assignment]
+        except Exception as exc:  # noqa: BLE001
+            log.warning("段间续接: 按级网格缩放未装上（%s）", exc)
+            return False
+        _GRID_FIT_STATE.update(depth=1, cls=cls, orig=orig, patched=_patched)
+        _FIT_LOGGED.clear()
+        log.debug("段间续接: 按级网格缩放已装上（%s.extra_conds）", cls.__name__)
+        return True
+
+
+def uninstall_cond_grid_fit() -> None:
+    """恢复 install_cond_grid_fit() 改过的 extra_conds（嵌套安装按层计数）。"""
+    with _GRID_FIT_LOCK:
+        if _GRID_FIT_STATE["depth"] <= 0:
+            return
+        _GRID_FIT_STATE["depth"] -= 1
+        if _GRID_FIT_STATE["depth"] > 0:
+            return
+        cls = _GRID_FIT_STATE["cls"]
+        orig = _GRID_FIT_STATE["orig"]
+        patched = _GRID_FIT_STATE["patched"]
+        try:
+            if cls is not None and orig is not None:
+                if getattr(cls, "extra_conds", None) is patched:
+                    cls.extra_conds = orig  # type: ignore[assignment]
+                else:
+                    log.warning(
+                        "段间续接: %s.extra_conds 已被别人改过，跳过恢复",
+                        getattr(cls, "__name__", cls),
+                    )
+        finally:
+            _GRID_FIT_STATE.update(depth=0, cls=None, orig=None, patched=None)
+            _FIT_LOGGED.clear()
+
+
 def apply_motion_context(
     positive,
     latent: dict,
@@ -185,19 +369,22 @@ def apply_motion_context(
         # 只对视频流做空间整形，音频与时间轴不动（见 context_conform）。
         from .context_conform import conform_context_latent
 
-        context_latent = conform_context_latent(context_latent, target_latent=latent)
-        src = video_from_latent(context_latent)
-        src_w, src_h = int(src.shape[4]) * 16, int(src.shape[3]) * 16
-        if (src_w, src_h) != (width, height):
+        # 静态兜底：按本段目标网格缩一份（不装按级钩子时的行为与旧版一致）
+        fitted_context = conform_context_latent(context_latent, target_latent=latent)
+        src_fitted = video_from_latent(fitted_context)
+        if (int(src_fitted.shape[4]) * 16, int(src_fitted.shape[3]) * 16) != (width, height):
             raise ValueError(
-                f"段间引导: context 整形后仍是 {src_w}x{src_h}，当前段 {width}x{height}；"
-                "context_conform 未能对齐目标网格"
+                f"段间引导: context 整形后仍是 "
+                f"{int(src_fitted.shape[4]) * 16}x{int(src_fitted.shape[3]) * 16}，"
+                f"当前段 {width}x{height}；context_conform 未能对齐目标网格"
             )
         log.info(
-            "段间引导: 自动检测到画布不一致，context 视频流 %dx%d → %dx%d（音频/时间轴不动）",
+            "段间引导: 自动检测到画布不一致，context 视频流 %dx%d → %dx%d"
+            "（本段网格；每级采样前还会按当级网格重缩一次，音频/时间轴不动）",
             old_w, old_h, width, height,
         )
     else:
+        fitted_context = context_latent
         log.debug("段间引导: 前后画布一致（%dx%d），不做空间整形", width, height)
     if int(src.shape[1]) != int(video.shape[1]):
         raise ValueError(
@@ -211,10 +398,20 @@ def apply_motion_context(
     if n >= frame_count:
         raise ValueError(f"段间引导: 无法把 {n} 帧钉进 {frame_count} 帧的片段")
 
-    blocks, offsets, covered = _video_tail_blocks(context_latent, n)
+    # 钉入块：静态兜底取自"按本段网格缩过的"那份；FIT_SOURCE_KEY 保留**原始**块，
+    # 供按级缩放（install_cond_grid_fit）在图里放大后重缩 —— 原件丢了就只能从缩小版
+    # 放大回去，第二级会糊。
+    blocks_fitted, offsets, covered = _video_tail_blocks(fitted_context, n)
+    blocks_source, _, _ = _video_tail_blocks(context_latent, n)
+    target_hw = (int(video.shape[3]), int(video.shape[4]))
     ctx_keyframes = [
-        {"resolved_frame_index": int(p), "latent": blk}
-        for p, blk in zip(offsets, blocks)
+        {
+            "resolved_frame_index": int(p),
+            "latent": fitted,
+            FIT_SOURCE_KEY: source,
+            FIT_TAG_KEY: target_hw,
+        }
+        for p, fitted, source in zip(offsets, blocks_fitted, blocks_source)
     ]
 
     # 音频：从上一段 latent 直接切尾部，作为 stock reference 追加
@@ -246,7 +443,7 @@ def apply_motion_context(
     trim = covered
     log.info(
         "段间引导: 钉入 %d 帧（%d latent steps @ %dx%d），音频 %d 步，解码后裁 %d 帧",
-        n, len(blocks), width, height, rt, trim,
+        n, len(blocks_fitted), width, height, rt, trim,
     )
     return out, trim
 

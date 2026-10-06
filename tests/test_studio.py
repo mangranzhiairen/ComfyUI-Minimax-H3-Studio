@@ -416,6 +416,106 @@ class ContextConformTest(unittest.TestCase):
                 [[None, {}]], av(7, 6, 8), av(7, 12, 16), 22, conform=False
             )
 
+    def test_motion_context_keeps_source_block_for_per_stage_fit(self):
+        """钉入条目要同时带「本段网格那份」和「原始那块」。
+
+        采样流程（子图）可以中途放大 latent（二采），第二级靠原始块重新缩放；
+        原件丢了就只能从缩小版放大回去（糊）。
+        """
+        import torch
+
+        from studio.motion_context import FIT_SOURCE_KEY, apply_motion_context
+
+        def av(t, h, w):
+            video = (
+                torch.arange(t * h * w, dtype=torch.float32)
+                .reshape(1, 1, t, h, w)
+                .expand(1, 24, t, h, w)
+                .contiguous()
+            )
+            return {"samples": self._nested(video, torch.zeros(1, 32, 2, 207))}
+
+        latent = av(37, 6, 8)     # 本段（第一级）网格 6x8
+        context = av(7, 12, 16)   # 上一段：放大后的网格 12x16
+        out, trim = apply_motion_context([[None, {}]], latent, context, 22)
+        self.assertEqual(trim, 22)
+        kfs = [k for k in out[0][1]["minimax_keyframes"] if "latent" in k]
+        self.assertEqual(len(kfs), 7)
+        for kf in kfs:
+            # 静态兜底那份 = 本段（第一级）网格
+            self.assertEqual(tuple(kf["latent"].shape)[-2:], (6, 8))
+            # 原件 = 上一段自己的网格
+            self.assertEqual(tuple(kf[FIT_SOURCE_KEY].shape)[-2:], (12, 16))
+
+    def test_fit_cond_video_latents_follows_stage_grid(self):
+        """按级缩放：第一级缩到目标网格；第二级若正好是原生网格则原样（零重采样）。"""
+        import torch
+
+        from studio.motion_context import FIT_SOURCE_KEY, fit_cond_video_latents
+
+        src = torch.arange(1 * 1 * 1 * 12 * 16, dtype=torch.float32).reshape(1, 1, 1, 12, 16)
+        kf = {
+            "resolved_frame_index": 0,
+            "latent": torch.zeros(1, 1, 1, 6, 8),
+            FIT_SOURCE_KEY: src,
+        }
+        kwargs = {"minimax_keyframes": [kf]}
+
+        stage1 = fit_cond_video_latents(kwargs, [(1, 24, 37, 6, 8), (1, 32, 2, 207)])
+        self.assertEqual(tuple(stage1["minimax_keyframes"][0]["latent"].shape)[-2:], (6, 8))
+
+        stage2 = fit_cond_video_latents(kwargs, [(1, 24, 57, 12, 16), (1, 32, 2, 300)])
+        got2 = stage2["minimax_keyframes"][0]["latent"]
+        self.assertEqual(tuple(got2.shape)[-2:], (12, 16))
+        self.assertTrue(torch.equal(got2, src))  # 原生网格：逐元素等于原件，没有二次插值
+        self.assertIs(got2, src)  # 同网格时连拷贝都没有：直接原样返回原件本身
+        # 没有 keyframes/refs 的条件（例如负条件）原样返回，一点动作都没有
+        untouched: dict = {}
+        self.assertIs(fit_cond_video_latents(untouched, [(1, 24, 57, 6, 8)]), untouched)
+
+        # 入参不被就地改写（每一级都从同一份出发，可重复）
+        self.assertEqual(tuple(kwargs["minimax_keyframes"][0]["latent"].shape)[-2:], (6, 8))
+
+    def test_install_cond_grid_fit_patches_and_restores(self):
+        """按级缩放钩子：装上后 extra_conds 前会缩；卸下后原方法回来（嵌套按层计数）。"""
+        import torch
+
+        from studio.motion_context import (
+            FIT_SOURCE_KEY,
+            install_cond_grid_fit,
+            uninstall_cond_grid_fit,
+        )
+
+        class DummyModel:
+            def extra_conds(self, **kwargs):
+                return {"minimax_keyframes": kwargs.get("minimax_keyframes")}
+
+        class DummyPatcher:
+            model = DummyModel()
+
+        original = DummyModel.extra_conds
+        self.assertTrue(install_cond_grid_fit(DummyPatcher()))
+        self.assertTrue(install_cond_grid_fit(DummyPatcher()))  # 嵌套一层
+        try:
+            self.assertIsNot(DummyModel.extra_conds, original)
+            kf = {
+                "resolved_frame_index": 0,
+                "latent": torch.zeros(1, 1, 1, 6, 8),
+                FIT_SOURCE_KEY: torch.zeros(1, 1, 1, 12, 16),
+            }
+            out = DummyModel().extra_conds(
+                minimax_keyframes=[kf], latent_shapes=[(1, 24, 57, 12, 16), (1, 32, 2, 300)]
+            )
+            self.assertEqual(
+                tuple(out["minimax_keyframes"][0]["latent"].shape)[-2:], (12, 16)
+            )
+        finally:
+            uninstall_cond_grid_fit()
+            self.assertIsNot(DummyModel.extra_conds, original)  # 还留着一层
+            uninstall_cond_grid_fit()
+        self.assertIs(DummyModel.extra_conds, original)  # 已恢复
+
+
 
 class SegmentCacheUtilTest(unittest.TestCase):
     def test_fingerprint_stable_and_sensitive(self):

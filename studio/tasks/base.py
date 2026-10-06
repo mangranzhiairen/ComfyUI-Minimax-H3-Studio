@@ -153,14 +153,27 @@ class BaseTask(ABC):
 
         # 真实链路：conditioning（官方节点）→ 采样（官方自定义采样节点组合）
         positive, latent = run_minimax_conditioning(self.ctx, conditioning)
+        grid_fit = False
         if use_continuity:
-            from ..motion_context import apply_motion_context as _apply_mc
+            from ..motion_context import (
+                apply_motion_context as _apply_mc,
+                install_cond_grid_fit,
+                uninstall_cond_grid_fit,
+            )
 
             positive, trim_frames = _apply_mc(
                 positive, latent, prev_av, self.ctx.continuity_frames
             )
+            # 钉入内容按"当级采样网格"缩放：采样流程（子图）可能中途放大 latent（二采），
+            # 第二级换了画布后条件行必须跟着重缩，否则 core 报 shape mismatch。
+            # 装不上时退回 apply_motion_context 里按本段网格做的静态那份。
+            grid_fit = install_cond_grid_fit(self.ctx.model)
 
-        samples = self.sample(positive, latent)
+        try:
+            samples = self.sample(positive, latent)
+        finally:
+            if grid_fit:
+                uninstall_cond_grid_fit()
 
         return SegmentResult(
             segment_index=0,
