@@ -15,7 +15,8 @@ studio/
 ├── executor.py             # StudioExecutor：编排「采样-解码分离」流水线
 ├── tasks/                  # 任务子类：__init__.py（TASK_REGISTRY + create_task 工厂）
 │                           #          base.py 模板方法 + t2v/i2v/fl2v/r2v/v2v/rv2v 六子类
-├── sampling.py             # 官方 MiniMax H3 真实采样链路（conditioning → KSampler → 解码）
+├── sampling.py             # 官方 MiniMax H3 采样链路 + build_pipeline_runtime（流程执行器零件）
+├── pipeline.py             # 自定义采样流程执行器：跑前端摊平的平铺节点图 → AV latent
 ├── motion_context.py       # 段间引导：上一段 latent 尾部钉入 + 相位网格
 ├── context_conform.py      # 通用 context 空间整形：异画布时把上一段视频 latent 缩到目标网格
 ├── segment_cache.py        # SQLite 任务库 + latent/preview 文件 + 两级指纹
@@ -52,6 +53,7 @@ studio/
 
 - `sampleFp`：抽卡级反悔——锁定某次历史采样，Queue 时该段跳过采样直接用该 latent 出片（16 位 hex 校验）。
 - `continuity`：段间续接开关（本段把上一段 latent 尾部钉入）。
+- `pipeline?`：片段绑定的自定义采样流程 `{ id, name, graph }`（缺省/空 = 内置官方流程）。`graph` 是前端摊平后的平铺节点图（`version/inputs/nodes/output/warnings`），后端只认摊平图、不认识子图定义；图结构/骨架/环的校验推迟到执行时（需 ComfyUI 节点表，见 §5.1）。
 - 校验清单：clips **至少 1 段**（空时间线拒绝）、模式白名单（t2v/i2v/fl2v/r2v/v2v/rv2v）、时长范围 **1.0–30.0s**（`MIN/MAX_DURATION_SEC`）、素材数量上限（图 9、视频 3、音频 3）、`sampleFp` 16 位 hex 格式等。
 
 辅助：
@@ -68,6 +70,7 @@ studio/
 - `ConditioningResult`：模式无关的条件描述（节点名、prompt、尺寸、长度、首尾帧、参考素材 dict、ref_image_size）；`with_length()` 派生采样长度（段间引导 = 可见帧 + 上下文帧）。
 - `SegmentResult`：单段结果（segment_index、frames、conditioning、av_latent…）。
 - `BaseTask.execute()` 模板：`validate() → build_conditioning() → [段间引导：长度加预算] → run_minimax_conditioning → [钉入上一段 latent] → sample（SamplerCustomAdvanced 组合）→ 返回 AV latent（不解码）`。
+- **采样分支**：`self.segment.pipeline is not None` 时走 `await self._sample_with_pipeline(positive, latent)`——`build_pipeline_runtime(...)` 后 `await run_pipeline_graph(pipeline.graph, runtime, prompt_id=f"studio-pipeline-{id}")`；否则 `sample_single_stage` 走内置官方链。`PipelineError` 会被补上「片段 {id} 的采样流程「{name}」无法执行：{exc}」再抛。
 - `use_continuity = prev_av is not None`：是否真续接取决于执行器是否传入上一段 latent。
 
 ### 3.2 模式子类
@@ -113,6 +116,17 @@ MiniMaxH3ImageToVideo / ReferenceToVideo   # conditioning + AV latent（V3 节�
 - `run_minimax_conditioning(ctx, cr)`：素材经 `media_loader` 加载后按关键词参数传入官方节点（`ref_images` 等 dict 结构即官方 `ref_image_N` autogrow 语义）；宽高向下对齐 32。
 - 进度：包装 `guider.sample` 注入每步回调 → `TaskContext.progress` → executor 广播前端。
 - V3 节点输出统一经 `unpack_node_output` 取 args（兼容 tuple/list 旧式）。
+
+### 5.1 自定义采样流程执行器（pipeline.py + sampling.build_pipeline_runtime）
+
+片段可挂一份自定义采样流程：构图在 **ComfyUI 原生子图编辑器**里做，Queue 时前端把子图**摊平成平铺节点图**（API 格式）随 payload 下发（`clips[].pipeline.graph`），后端 `run_pipeline_graph` 执行。它取代的是「采样」这一步——conditioning/解码/段间引导/缓存仍由本插件负责。
+
+- **骨架输入槽**（入口节点 `STUDIO_INPUT_NODE = "__studio__"`）是插件喂给用户图的接口，共 6 个：`conditioning`(CONDITIONING)、`latent`(LATENT，AV 空 latent)、`noise`(NOISE)、`model`(MODEL，已做 SigmaShift)、`sampler`(SAMPLER)、`scheduler`(SIGMAS)。引用格式 `["__studio__", "<槽名>"]`；旧版按下标引用会直接报错并提示硬刷新前端。
+- `sampling.build_pipeline_runtime(*, model, positive, latent, seed, steps, sampler_name, scheduler, shift_video, shift_audio, on_step=None) → PipelineRuntime`：惰性求值、按槽缓存。scheduler 用该模型算 SIGMAS（BasicScheduler，denoise=1.0）、sampler=KSamplerSelect、noise=RandomNoise、model 已套 SigmaShift——**只连骨架槽的等价图与内置 `sample_single_stage` 语义一致**，可作回归基准。给了 `on_step` 就挂到 model 上（OUTER_SAMPLE 包装），用户链里有几段采样都能拿到进度与 x0 预览。
+- **执行**：`validate_graph`（空图/无输出/输出指向不存在节点/引用非骨架槽）→ `bind_studio_inputs` → `topo_order`（从输出反向后序 DFS，检测环与悬空连线）→ `async _run_nodes` 逐个执行。节点映射、输入解析、V1/V3 分派、输出拆包复用官方 `execution.get_input_data` / `get_output_data`（输出经 `_OutputStore` 适配），只是调度自写、一次只跑一个节点。
+- **错误可读**：节点类型不存在 → 提示装对应插件；输入缺线 → 提示补接线；图里还有子图或异步节点（`has_subgraph` / `has_pending`）→ 明确「暂不支持」。统一抛 `PipelineError`。
+- **异步、不另起线程**：内层走官方异步执行器，全程在 ComfyUI 事件循环线程（见 §10「执行线程」），避免中断时跨线程释放 CUDA 张量导致进程 abort。
+- 输出槽：`output` 为 `[节点id, 输出槽]`；结果若为单元素列表自动脱壳，返回该段 AV latent。
 
 ## 6. 段间引导（motion_context.py）
 
@@ -186,6 +200,7 @@ output/minimax_h3_studio/{node_id}/preview_{sample_fp}.webp
 | DELETE /tasks/{id}/clips/{clip_id}/samples/{sample_fp} | 删单个采样样本 |
 | DELETE /tasks/{id}/clips/{clip_id}/versions/{version_id} | 删历史版本及其采样 |
 | GET /tasks/{id}/export · POST /tasks/import | 任务导入导出 |
+| GET /pipelines · PUT /pipelines | 全局采样流程库：读全库 / 覆盖式整库保存（空覆盖非空需 `confirm_clear`，否则 409） |
 
 ## 9. 采样预览（tae_preview.py）
 
@@ -218,6 +233,7 @@ output/minimax_h3_studio/{node_id}/preview_{sample_fp}.webp
 ```bash
 # 后端纯函数单测（无需 ComfyUI 环境；torch 依赖）
 python tests/test_studio.py
+python tests/test_pipeline.py    # 采样流程执行器：拓扑/校验/骨架绑定/端到端小图
 
 # 语法检查
 python -m py_compile studio/segment_cache.py studio/http_routes.py

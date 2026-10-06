@@ -38,6 +38,12 @@
 - ✍️ **写提示词更省事**
   输入 `@` 直接引用已上传的素材（自动生成 `<Picture 1>` 这类占位、带缩略图）；输入 `/` 快速补全镜头/机位/说话者等专业写法，不用背格式。
 
+- 🧩 **默认采样之外，还能换一套「采样流程」（进阶）**
+  默认走官方采样链、不用管；想上二采高清放大或社区分享的采样方案，可以给片段挂一份自定义采样流程（在 ComfyUI 原生子图编辑器里搭），片段级替换、互不影响。仓库内置「二采1.0」示例可直接导入。
+
+- 📦 **采样流程是全局资产，能复用与分享**
+  自定义采样流程存在全局流程库（跨任务共享），可新建/编辑/复制/删除/导入导出，一份流程能同时挂在多张卡片上，也可以一键应用给全部片段。
+
 - 💾 **换设备不丢活**
   数据库存储任务信息，重开 ComfyUI 或换工作流都能一键恢复，更换设备时也可导入导出。
 
@@ -98,6 +104,17 @@ cd web && npm install && npm run build && cd ..
 
 > **提示**：采样参数（seed 等）随样本记录；**修改时间线内容（提示词/素材）后旧 latent 缓存自动失效**，Queue 时按当前内容重新采样。
 
+### 自定义采样流程（可选 · 进阶）
+
+默认不需要碰。想让某个镜头用不同的采样工艺（例如「二采高清放大」）：
+
+1. 工具栏打开「采样流程库」→ 新建一份流程，会在 **ComfyUI 原生子图编辑器**中打开，里面预置了 6 个输入槽（conditioning / latent / noise / model / sampler / scheduler）和一个输出槽（latent）。
+2. 从这些槽拉线搭自己的采样链，保存后自动回写流程库。
+3. 在片段卡片的「⊞ 采样流程」下拉里选中它（或「应用到全部」）；不选 = 官方流程。
+4. 导入 / 导出：流程以 `.studio-pipeline.json` 单文件分享；仓库内置示例 [`example_sample_workflow/二采1.0.studio-pipeline.json`](example_sample_workflow/二采1.0.studio-pipeline.json)。
+
+已知限制：平铺图内暂不支持嵌套子图与异步节点；节点类缺失或漏接线会给出可读报错。设计细节见[自定义采样流程设计](doc/custom-sampling-plan.md)与[后端模块文档](doc/backend-modules.md)。
+
 ---
 
 ## 开发者
@@ -112,15 +129,17 @@ cd web && npm install && npm run build && cd ..
 ├── nodes/studio_console.py  # 创意工作台节点（INPUT_TYPES + execute）
 ├── studio/                  # 后端：执行器 / 任务 / 采样 / 数据层 / 路由 / 预览
 ├── web/                     # 前端：Vue 3 + TS + Vite + Naive UI + Pinia
-├── doc/                     # 模块级文档（后端 / 前端）
+├── doc/                     # 模块级文档（后端 / 前端 / 自定义采样流程设计）
+├── example_sample_workflow/ # 示例采样流程（.studio-pipeline.json，可导入流程库）
 ├── scripts/build_plugin.{bat,sh}  # 一键打包脚本（Windows / Linux·macOS）
 ├── scripts/bump_version.py  # 升版本（只写 VERSION，唯一来源）
 ├── scripts/check_version.py # 版本一致性校验（发版门禁）
 ├── tests/test_studio.py     # 后端单测（无需 ComfyUI 环境）
+├── tests/test_pipeline.py   # 采样流程执行器单测
 └── assets/screenshots/      # README 功能截图
 ```
 
-模块级说明见 [`doc/`](doc/)：[后端](doc/backend-modules.md) · [前端](doc/frontend-modules.md)。
+模块级说明见 [`doc/`](doc/)：[后端](doc/backend-modules.md) · [前端](doc/frontend-modules.md) · [自定义采样流程](doc/custom-sampling-plan.md)。
 
 ### 版本号管理
 
@@ -168,6 +187,7 @@ npx vue-tsc --noEmit     # TS 类型检查
 
 # 后端（项目根，使用 ComfyUI venv）
 python tests/test_studio.py
+python tests/test_pipeline.py
 ```
 
 打包发布 zip（构建前端 + 收集运行时文件）：
@@ -184,7 +204,7 @@ bash scripts/build_plugin.sh   # Linux / macOS
 
 ## 数据与缓存
 
-- **任务元数据**：`ComfyUI/user/ComfyUI-MiniMaxH3-Studio/tasks.db`（SQLite：tasks / clip_versions / version_samples）
+- **任务元数据**：`ComfyUI/user/ComfyUI-MiniMaxH3-Studio/tasks.db`（SQLite：tasks / clip_versions / version_samples；另有全局 **pipeline_library** 采样流程库，跨任务共享）
 - **latent 缓存**：`ComfyUI/output/minimax_h3_studio/{node_id}/latent_{sample_fp}.pt`（指纹进文件名，存在即命中）
 
 ---

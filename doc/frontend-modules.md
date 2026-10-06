@@ -24,6 +24,7 @@ web/src/
 ├── components/           # UI 组件（见 §5）
 ├── composables/          # useDrag / usePreviewPlayer / usePreviewThumb
 ├── utils/promptDiff.ts   # 提示词版本 diff（历史比对）
+├── utils/subgraph.ts     # 采样流程接入：原生子图编辑器 + 骨架槽 + 摊平成平铺执行图
 ├── env.d.ts              # 类型声明（构建时环境）
 ├── auto-imports.d.ts     # unplugin-vue-components 自动生成
 └── styles/               # theme.ts（调色板）+ global.css
@@ -37,6 +38,7 @@ web/src/
 编辑（store）── $onAction 订阅（main.ts，防抖 100ms）──→ saveToDb（写 tasks.timeline）
 Queue ── serializeValue 实时构建 {taskId, payload} ──→ timeline_data widget ──→ 后端 executor
 加载工作流 ── nodeCreated/loadedGraphNode 读载体 → loadTask（按 taskId 从 DB 拉时间线）
+流程库（全局）── 挂载 loadPipelines() GET /pipelines → store.pipelines；子图编辑每秒回写 → savePipelines() PUT 整库
 ```
 
 - **唯一状态源**：Pinia `timeline` store 持有时间线全部状态；组件不各自维护数据。
@@ -73,6 +75,7 @@ Queue ── serializeValue 实时构建 {taskId, payload} ──→ timeline_da
 | historyByClipId | 按 clip_id 索引的历史（versions + samples，由后端 history 接口拉取） |
 | samplingProgress | 当前采样片段的进度 + live 预览（executor 广播） |
 | showRestoreModal / showHistoryPanel | 跨组件 UI 弹窗开关 |
+| pipelines / pipelinesLoaded / pipelinesSaveFailed | 全局采样流程库条目 / 是否已拉到后端库（守卫整库回写）/ 整库保存失败标记 |
 
 ### 核心 actions
 
@@ -81,6 +84,7 @@ Queue ── serializeValue 实时构建 {taskId, payload} ──→ timeline_da
 - 任务库：`newTask / loadTask / unloadTask / createTask / renameTask / duplicateTask / deleteTask / saveToDb / fetchTaskList / exportTask / importTaskFile`
 - 历史与反悔：`fetchHistory / addClipsFromHistory / promptSnapshotOf / loadPromptEntry（卡片级回填）/ applySample（抽卡级锁定）/ releaseSample / deleteClip / deleteSample / deleteVersion`
 - 采样进度：`setSamplingProgress / setLivePreview`（合并语义：进度与 preview 独立更新，防止预览闪断）
+- 采样流程库：`loadPipelines / savePipelines / schedulePipelineSave / flushPipelineSave / createPipeline / openPipelineEditor / exportPipeline / importPipelineFile / updatePipelineDef / renamePipeline / duplicatePipeline / deletePipeline / setClipPipeline / applyPipelineToAll`；getter `pipelineById / pipelineOf(clip) / pipelineUsage(id)`（定义只在库里一份，片段只存 `pipelineId`）
 
 ### 契约类型（types/timeline.ts）
 
@@ -88,7 +92,10 @@ Queue ── serializeValue 实时构建 {taskId, payload} ──→ timeline_da
 - `ReferenceMedia`：name/path/preview（preview 仅前端展示，不进数据契约）
 - `ClipPayload`：发给后端的序列化形态（素材只保留 path + kind）
 - `PromptSnapshot`：历史条目画面语义快照（mode/prompt/素材）
-- `VersionSample`：采样记录（含 sampleFp/canvas/durationSec/exists/previewUrl 等运行时信息）
+- `VersionSample`：采样记录（含 sampleFp/canvas/durationSec/exists/previewUrl + **latentWidth/latentHeight** 实际 latent 尺寸，旧样本为 null）
+- `PipelineLibraryEntry`：全局流程库条目（id/name/def，def 是原生子图定义）
+- `PipelineGraph` / `PipelineGraphNode` / `PipelineGraphInput`：摊平后的平铺执行图（`version:1 / inputs / nodes / output / warnings`）
+- `ClipPipelinePayload`：片段下发的流程（id/name/graph?）；`Clip.pipelineId?: string|null` 只存库引用（缺省/空 = 内置官方流程）；`@deprecated LegacyInlinePipeline` 仅兼容旧内联形态
 - 序列化规约：`toClipPayload`（UI → 契约）/ `fromClipPayload`（契约 → UI，图片按 path 重建 /view?preview=webp 预览 URL）
 
 ## 5. 组件职责
@@ -96,21 +103,31 @@ Queue ── serializeValue 实时构建 {taskId, payload} ──→ timeline_da
 | 组件 | 职责 |
 |---|---|
 | App.vue | 布局（Toolbar + Timeline + ClipDetailPanel）、naive-ui provider |
-| Toolbar.vue | 任务库下拉（新建/重命名/**复制**/导出/导入/删除，名称弹窗）、恢复片段入口、画布参数（ResolutionParam）、＋片段、总时长 |
+| Toolbar.vue | 任务库下拉（新建/重命名/**复制**/导出/导入/删除，名称弹窗）、恢复片段入口、画布参数（ResolutionParam）、**采样流程库**统一管理（新建/编辑/重命名/复制/删除/导入导出、批量应用到全部 / 全部取消）、＋片段、总时长 |
 | Timeline.vue | 时间线容器：缩放/平移、fit 显示全部、选中联动 |
 | TimelineTrack.vue | 片段轨道行渲染 |
 | TimelineRuler.vue | 时间刻度尺 |
-| ClipCard.vue | 单个片段卡片：模式色、素材缩略图、采样进度/结果态、缓存命中绿标、hover 大预览弹框、删除/复制、打开历史/恢复 |
+| ClipCard.vue | 单个片段卡片：模式色、素材缩略图、采样进度/结果态、缓存命中绿标、**采样流程选择（⊞ 下拉，选择即绑定、不打开子图；流程被删则回默认+警示色）**、hover 大预览弹框、删除/复制、打开历史/恢复 |
 | ClipDetailPanel.vue | 选中片段编辑面板：模式/时长/续接/历史入口 + **PromptEditor + 参考素材区** |
 | PromptEditor.vue | contenteditable 富文本：`@` 素材引用 + `/` 符号补全 + 原子 chip（见 §6） |
 | RefGrid.vue | 参考素材网格（ClipDetailPanel 参考素材区）：紧凑列表 + SortableJS 拖拽排序，编号 = 下标 + 1、无空位，含「＋添加」入口卡 |
 | UploadSlot.vue | 素材槽：本地上传（POST /upload）与"选已有"（list_input_media）、预览缩略图、替换/移除 |
-| PromptHistoryPanel.vue | 历史弹窗主体：按画布分组的版本列表 + 采样记录（抽卡锁定/删除、预览播放）、版本比对（PromptDiffModal） |
+| PromptHistoryPanel.vue | 历史弹窗主体：按画布分组的版本列表 + 采样记录（抽卡锁定/删除、预览播放）、版本比对（PromptDiffModal）；显示实际 latent 尺寸，与采样画布不一致时高亮提示「自定义采样流程可能二采放大」 |
 | HistoryRestoreModal.vue | 从历史手动挑选片段恢复到时间线（跨任务库流程） |
 | PromptDiffModal.vue | 提示词版本 diff 弹窗（基于 utils/promptDiff.ts） |
 | PreviewThumb.vue | 预览缩略图：取 WebP **首帧**静态显示（usePreviewThumb）；动画播放由采样 live 播放器（usePreviewPlayer）另担 |
 | ResolutionParam.vue | 画布分辨率/帧率选择：宽高比（官方 ResolutionSelector 同款 8 种）**× 目标百万像素（0.1~2 MP）** 驱动宽高，官方算法 `round` 到 32 的倍数（与官方 16:9 表逐行一致：0.4MP→864×480、0.98MP→1344×768、2.0MP→1920×1088）；按钮显示 WxH@fps |
 | promptSnippets.ts | `/` 符号表（纯 TS：镜头/说话者/对话/字段/任务类型/关系标记/相机运动/引用标签 8 组 + 智能编号） |
+
+### 采样流程接入（utils/subgraph.ts）
+
+自定义采样流程的**构图**直接复用 ComfyUI 原生子图编辑器（不重造画布），Queue 时由前端摊平下发：
+
+- `newClipPipeline(label) / cloneClipPipeline(src, label)`：新建/复制流程定义（含骨架子图 def）。
+- `openClipPipeline(entry, onDef)`：把 def 注册进原生 `app.graph`、打开子图编辑器（`focusSubgraphIo` 定位骨架输入/输出）。子图里只有一个 `__studio__` 入口节点提供 6 个骨架槽（conditioning/latent/noise/model/sampler/scheduler），用户从这些槽接自己的采样链。
+- `startPipelineSync`：子图编辑期间每 **1000ms**（`SYNC_INTERVAL_MS`）把原生图快照回写成 def，经 `onDef → updatePipelineDef` 防抖落库；`flushClipPipelineSync()` 在卡片卸载/关编辑器时补写最后一次。
+- `flattenClipPipeline(pipeline): PipelineGraph`：**方案 A——前端摊平**。把子图定义递归展开成可直接执行的平铺节点图（`version:1 + inputs + nodes + output + warnings`），Queue 时随 payload 下发；后端只跑平铺图、不认识子图（见后端 §5.1）。摊平会把骨架引用改写为 `["__studio__","<槽名>"]`。
+- 常量：`SUBGRAPH_INPUT_ID=-10` / `SUBGRAPH_OUTPUT_ID=-20`（原生子图 IO 虚拟节点 id）、`LGRAPH_SCHEMA_VERSION=1`、`STUDIO_INPUT_NODE="__studio__"`。
 
 ## 6. 提示词编辑器（PromptEditor.vue）
 
@@ -129,7 +146,8 @@ Queue ── serializeValue 实时构建 {taskId, payload} ──→ timeline_da
 
 ## 8. 与后端/ComfyUI 的桥
 
-- HTTP：经 `window.app.api.fetchApi`（自动加 `/api` 前缀）调后端 `/minimax/studio/*` 路由（素材列表、任务 CRUD、复制、历史、导入导出）。
+- HTTP：经 `window.app.api.fetchApi`（自动加 `/api` 前缀）调后端 `/minimax/studio/*` 路由（素材列表、任务 CRUD、复制、历史、导入导出、采样流程库 GET/PUT /pipelines）。
+- 流程库加载：面板挂载即 `void store.loadPipelines()`（main.ts 把 `loadPipelines/savePipelines` 从 INTERNAL_ACTIONS 排除，避免自动保存订阅递归触发）。
 - WebSocket 事件（后端 `server.send_sync` → 前端 app 监听）：
 
 | 事件 | 前端处理 |
@@ -154,7 +172,7 @@ npm run dev              # 独立预览（http://localhost:5178）
 
 `npm run dev` 走的是浏览器独立预览（`index.html` → `preview.ts`），**不依赖 ComfyUI**。为了让前端功能（任务库 / 历史 / 素材 / 采样）能在 dev 全量跑通，`web/src/dev/` 提供了一个**自包含的 mock 后端**，只被 `preview.ts` 与 vite dev 分支引用：
 
-- **`mockPlugin.ts`**：vite dev 中间件插件（见 `vite.config.ts` dev 分支），本地实现 `/view`、`/minimax/studio/*`（任务 CRUD/历史/复制/导入导出）、`/upload` 的内存后端，返回与真实后端一致的字段，图片用内存色块/上传字节可显示；状态存 dev server 进程内存（刷新不丢、重启 dev server 重置）。
+- **`mockPlugin.ts`**：vite dev 中间件插件（见 `vite.config.ts` dev 分支），本地实现 `/view`、`/minimax/studio/*`（任务 CRUD/历史/复制/导入导出/流程库 /pipelines）、`/upload` 的内存后端，返回与真实后端一致的字段，图片用内存色块/上传字节可显示；状态存 dev server 进程内存（刷新不丢、重启 dev server 重置）。
 - **`mockClient.ts`**：前端侧接线——`installMockApi()` 把 `window.app.api` 装上（fetchApi 直连 dev mock），`ensureDemoTask()` 播种一个演示任务，`runMockSampling()` 对启用片段自动跑一段假采样（进度 sampling→decoding、live 帧、写历史）。
 
 `preview.ts` 的 bootstrap：装 mock api → 播种演示任务 → 挂载 App → `store.loadTask(演示任务)`（走与 ComfyUI 相同的真实 loadTask 链路）→ 自动跑一遍假采样，让历史区/卡片徽标出现可验证数据。

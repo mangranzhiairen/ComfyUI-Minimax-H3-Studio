@@ -1,7 +1,17 @@
-# 自定义采样流程（方案）
+# 自定义采样流程（设计文档）
 
-> 状态：**待评审**。本文只定方向、边界与分期，不含实现细节。
-> 背景见 [backend-modules.md](backend-modules.md) 的 `sampling.py` / `tasks/base.py` 两节。
+> 状态：**已实现**（自 v0.2.1 起）。本文保留为设计记录；落地与规划略有差异，以「实现纪要」（§0）为准。
+> 背景见 [backend-modules.md](backend-modules.md) 的 `sampling.py` / `tasks/base.py` 两节；执行器细节见其 §5.1。
+
+## 0. 实现纪要（与本文规划的差异）
+
+- **编辑器**：ComfyUI 原生子图编辑器（`web/src/utils/subgraph.ts`），预置 `__studio__` 入口 + 6 个骨架槽。
+- **摊平**：方案 A——前端把子图摊平成平铺节点图，后端只认平铺图（§6.3 采用「前端做」）。
+- **执行**：做法二——复用 `get_input_data` / `get_output_data` / `DynamicPrompt`，自写拓扑排序与调度循环（`studio/pipeline.py`，§6.2）。
+- **骨架槽最终为 6 个**（§5.1）：`conditioning / latent / noise / model / sampler / scheduler`。原规划的 negative、seed/steps/cfg、sampler_name、shift_video/shift_audio、prev_latent、frame_count **没有**进骨架——采样参数由 `build_pipeline_runtime` 预先组合进 model/scheduler/sampler/noise 槽；段间引导仍在插件侧、在执行流程之前完成。
+- **模型与片段的关系**（§9.1）：结案为**全局流程库 + 片段只存 id 引用**（一份共享模型可被多个片段/任务引用），支持导出/导入与任务导入时并入。
+- **进度/预览/显存**（§8 三个「不确定性」）：已落实——进度与 x0 预览通过包装 model 的 OUTER_SAMPLE 扩散到用户链里每段采样；显存沿用 ComfyUI 模型管理，不额外持有。
+- 已知限制：平铺图内不支持嵌套子图与异步节点（明确报错）；节点类缺失/漏接线给出可读错误。
 
 ## 1. 目标
 
@@ -49,25 +59,24 @@
 - 可随插件内置（官方流程本身也可以有一份等价模型）。
 - 与工作流一样是 JSON，天然可流通。
 
-## 5. 骨架规范（核心待定项）
+## 5. 骨架规范（已定稿）
 
 这是整个方案的地基：**规范必须窄到能保证"凡是合规的，一定可驱动"。**
 
 ### 5.1 输入槽（studio 喂给模型）
 
+**最终落地**（与 `studio/pipeline.py` 的 `STUDIO_SLOTS` 一致），引用格式 `["__studio__", "<槽名>"]`：
+
 | 槽位 | 类型 | 说明 |
 |---|---|---|
-| model | MODEL | 采样模型 |
-| positive | CONDITIONING | 条件 |
-| negative | CONDITIONING | 可选（官方流程默认不用，走 BasicGuider） |
-| latent | LATENT | AV latent（H3 的 video+audio 双流） |
-| seed / steps / cfg | INT / INT / FLOAT | 采样参数 |
-| sampler_name / scheduler | STRING | 采样器与调度器 |
-| shift_video / shift_audio | FLOAT | H3 SigmaShift 双流偏移 |
-| prev_latent | LATENT | 可选，段间引导用（上一段结果） |
-| frame_count | INT | 可选，片段帧数 |
+| conditioning | CONDITIONING | 条件（已由插件构建，含钉入的段间引导） |
+| latent | LATENT | AV 空 latent（H3 的 video+audio 双流） |
+| noise | NOISE | 噪声 |
+| model | MODEL | 已做 SigmaShift 的采样模型 |
+| sampler | SAMPLER | 采样器（KSamplerSelect） |
+| scheduler | SIGMAS | 调度（BasicScheduler，denoise=1.0） |
 
-> 现有 `sample_single_stage` 已有一个 `denoise` 形参但从未被使用，可顺势纳入规范。
+> 规划期曾列出更宽的槽集（negative、seed/steps/cfg、sampler_name、shift_video/shift_audio、prev_latent、frame_count）。最终收窄为上面 6 个：采样参数与 SigmaShift 由 `build_pipeline_runtime` 组合好再喂入，段间引导仍在插件侧完成，因此都无需暴露——骨架更窄，也更不容易出现「合规但驱动不了」的组合。
 
 ### 5.2 输出槽
 
@@ -135,21 +144,21 @@
 
 - 段间引导、latent 落盘、采样记账、解码、合并、锁定复用、片段级决策**全部保持现状，无需重写**。
 
-## 7. 分期
+## 7. 分期（全部已完成，保留作历史）
 
-### 阶段一：规范 + 官方等价模型
+### 阶段一：规范 + 官方等价模型 ✅
 - **交付**：骨架规范文档 + 一份描述"官方采样流程"的模型 JSON。
 - **验证**：把现有硬编码链完整表述成一份模型，看规范有没有缺口。零执行代码即可完成。
 
-### 阶段二：后端执行器
+### 阶段二：后端执行器 ✅
 - **交付**：读（已摊平的）模型图 JSON → 校验 → 拓扑排序 → 调用 → 返回 latent；接入 `BaseTask.sample()`（有模型走模型，无模型走官方）。
 - **验证（关键）**：用阶段一的"官方等价模型"执行，结果应与现在的硬编码链**一致**。这是天然回归测试。
 
-### 阶段三：片段级绑定 + 前端入口
+### 阶段三：片段级绑定 + 前端入口 ✅
 - **交付**：片段上的采样流程选择器；新建/编辑走原生子图编辑器；校验结果回显。
 - **验证**：用户能否独立完成"新建一份模型 → 挂到某片段 → 跑出不一样的结果"。
 
-### 阶段四：保存与生态
+### 阶段四：保存与生态 ✅
 - **交付**：模型保存/导出/导入；随插件内置若干模型；缺失节点检查。
 - **验证**：别人的模型能否被另一个用户直接用起来。
 
@@ -160,13 +169,13 @@
 | 模型内出现非纯计算节点 | 能力边界 | 规范约束 + 校验拦截 |
 | 子图 JSON 形态随 ComfyUI 前端升级变化 | 外部依赖 | 只依赖文件格式，不依赖前端内部 API |
 | 模型不合规 | 使用风险 | 明确报错，不做静默降级 |
-| 进度条 / 预览在模型内失效 | 体验缺口 | 阶段二实测确认（现为包装 `guider.sample` 注入） |
-| 显存管理在模型内不受控 | 体验缺口 | 阶段二实测确认 |
+| 进度条 / 预览在模型内失效 | 体验缺口 | **已解决**：`build_pipeline_runtime(on_step=...)` 包装 model（OUTER_SAMPLE），用户链里每段采样都有进度 + x0 预览 |
+| 显存管理在模型内不受控 | 体验缺口 | **已解决**：沿用 ComfyUI 模型管理，插件不额外持有；中断有专门的延迟清理（后端 §10） |
 
-**最需要先摸清的**：进度、预览、显存在"自己执行"这条路上到底是什么表现。这三样没有现成经验可参照，是阶段二的主要不确定性。
+**规划时最需要先摸清的**：进度、预览、显存在「自己执行」这条路上到底是什么表现——落地结论见 §0。
 
-## 9. 待定决策
+## 9. 待定决策（已结案）
 
-1. **模型与片段的关系**：每个片段一份独立模型 / 一份共享模型被多个片段引用 / 两层（共享 + 片段覆盖）。
-2. **骨架槽位范围**：最小集（够官方流程用）还是全集（含 denoise、negative 等）。
-3. **模型能表达的范围**：是否允许官方流程没有的能力（放大、多阶段精修、音视频分开处理）。
+1. **模型与片段的关系** → **全局流程库 + 片段 id 引用**：一份流程可被多个片段/任务共享，工具栏统一管理；无「片段私有覆盖」层（要改就改库里那份，或复制一份再挂）。
+2. **骨架槽位范围** → **最小集 6 槽**（conditioning/latent/noise/model/sampler/scheduler）；参数类不暴露，由 `build_pipeline_runtime` 组合。
+3. **模型能表达的范围** → **允许官方没有的能力**：仓库内置 `example_sample_workflow/二采1.0.studio-pipeline.json` 即「二采高清放大」示例。约束只有一条——平铺图里的节点必须是插件环境能直接执行的纯计算节点（不支持嵌套子图/异步节点）。
