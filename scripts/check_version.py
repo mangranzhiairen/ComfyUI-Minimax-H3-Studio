@@ -1,4 +1,4 @@
-"""版本一致性校验 —— 确认所有派生物都与仓库根 ``VERSION`` 一致。
+"""版本一致性校验 —— 确认所有派生物都与仓库根的单一版本源一致。
 
 用法::
 
@@ -7,11 +7,11 @@
 发版前必跑；任何不一致都会以非零退出码失败并指出具体位置。
 
 校验项：
-1. ``VERSION`` 存在、单行、符合语义化版本格式
-2. ``web/package.json`` 的 version
-3. ``web/package-lock.json`` 的两处 version（根 + ``packages[""]``）
-4. 消费方没有残留硬编码字面量（应改为读 VERSION）
-5. 若 ``web/dist`` 已构建，bundle 内注入的版本应为当前 VERSION（抓「改了没重新构建」）
+1. VERSION 存在、单行、符合语义化版本格式
+2. web/package.json 与 web/package-lock.json 不声明 version
+   （npm 侧一旦声明，就又出现第二个需要手改的版本号）
+3. 消费方没有残留硬编码字面量（应改为读 VERSION）
+4. 若 web/dist 已构建，bundle 内注入的版本应为当前 VERSION（抓改了没重新构建）
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
-# 中文 Windows 控制台是 GBK，打印 {✓} 这类符号会抛 UnicodeEncodeError 把脚本搞崩
+# 中文 Windows 控制台是 GBK，打印特殊符号会抛 UnicodeEncodeError 把脚本搞崩
 # （诊断信息全丢）。降级为 replace：中文仍正常显示，无法编码的字符变 "?"。
 if hasattr(sys.stdout, "reconfigure"):
     try:
@@ -39,10 +39,10 @@ DIST_JS = ROOT / "web" / "dist" / "minimax-h3-studio.js"
 SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$")
 
 # 是否要求已构建的前端 bundle 与 VERSION 一致。
-# - 直接运行本脚本（发布门禁）：True —— 防止 `build_plugin --no-build` 发出
+# - 直接运行本脚本（发布门禁）：True —— 防止 build_plugin --no-build 发出
 #   前后端版本不一致的包。
 # - bump_version.py 调用时置 False：刚改完版本号、还没重新构建属于正常中间态，
-#   声明的一致性（VERSION / package.json / lock / 无硬编码）才是 bump 必须保证的。
+#   声明的一致性（VERSION / npm 侧无版本 / 无硬编码）才是 bump 必须保证的。
 REQUIRE_DIST = True
 
 # 这些文件应当从 VERSION 读取，不得再出现硬编码版本字面量
@@ -50,12 +50,12 @@ NO_LITERAL_CHECKS: tuple[tuple[Path, re.Pattern[str], str], ...] = (
     (
         ROOT / "studio" / "http_routes.py",
         re.compile(r'PLUGIN_VERSION\s*=\s*["\']'),
-        "后端应 `from .version import PLUGIN_VERSION`，不要再赋值字面量",
+        "后端应 from .version import PLUGIN_VERSION，不要再赋值字面量",
     ),
     (
         ROOT / "web" / "src" / "dev" / "mockPlugin.ts",
         re.compile(r'version:\s*["\']\d+\.\d+\.\d+["\']'),
-        "dev mock 应读 VERSION 文件，不要再硬编码版本",
+        "dev mock 不应硬编码版本：version 由 vite.config.ts 传参注入",
     ),
 )
 
@@ -99,29 +99,28 @@ def _load_json(path: Path, rep: Report) -> dict | None:
     return None
 
 
-def check_package_json(version: str, rep: Report) -> None:
+def check_no_pkg_version(rep: Report) -> None:
+    """npm 侧不得再声明 version —— 否则又出现第二个需要手改的版本号。
+
+    web/package.json 是 private 包，npm run 与 vite 都不需要 version 字段；
+    删掉后版本唯一来源就是仓库根 VERSION。
+    """
     rel = PKG_JSON.relative_to(ROOT)
     data = _load_json(PKG_JSON, rep)
-    if data is None:
-        return
-    if data.get("version") == version:
-        rep.ok(f"{rel} version = {version}")
-    else:
-        rep.bad(f"{rel} version = {data.get('version')!r}，应为 {version!r}")
-
-
-def check_package_lock(version: str, rep: Report) -> None:
-    rel = PKG_LOCK.relative_to(ROOT)
-    data = _load_json(PKG_LOCK, rep)
-    if data is None:
-        return
-    root_v = data.get("version")
-    pkg_v = (data.get("packages") or {}).get("", {}).get("version")
-    for label, actual in (("根 version", root_v), ('packages[""] version', pkg_v)):
-        if actual == version:
-            rep.ok(f"{rel} {label} = {version}")
+    if data is not None:
+        if "version" in data:
+            rep.bad(f"{rel} 仍声明 version={data['version']!r}：请删除（唯一来源是根 VERSION）")
         else:
-            rep.bad(f"{rel} {label} = {actual!r}，应为 {version!r}")
+            rep.ok(f"{rel} 未声明 version")
+
+    rel_lock = PKG_LOCK.relative_to(ROOT)
+    lock = _load_json(PKG_LOCK, rep)
+    if lock is not None:
+        pkg_v = (lock.get("packages") or {}).get("", {}).get("version")
+        if "version" in lock or pkg_v is not None:
+            rep.bad(f"{rel_lock} 残留 version 字段（根或 packages 条目）：请删除")
+        else:
+            rep.ok(f"{rel_lock} 未声明 version")
 
 
 def check_no_literals(rep: Report) -> None:
@@ -159,8 +158,7 @@ def main() -> int:
         print(f"\n结果：失败（{rep.failed} 项）—— 版本源不可用，后续校验跳过")
         return 1
 
-    check_package_json(version, rep)
-    check_package_lock(version, rep)
+    check_no_pkg_version(rep)
     check_no_literals(rep)
     check_dist_bundle(version, rep)
 

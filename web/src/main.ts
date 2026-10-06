@@ -19,7 +19,7 @@ import { useTimelineStore } from "@/stores/timeline";
 import type { StudioPayload } from "@/types/timeline";
 import "@/styles/global.css";
 
-// 构建时注入（vite define，读 web/package.json）；运行时与后端 /version 对比做缓存自检
+// 构建时注入（vite define 读仓库根 VERSION）；运行时与后端 /version 对比做缓存自检
 declare const __STUDIO_VERSION__: string;
 
 // ComfyUI 前端运行时类型（最小声明，仅覆盖本扩展用到的部分）

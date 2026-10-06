@@ -1,16 +1,15 @@
 """插件版本 —— **单一来源**。
 
-版本号只在仓库根目录的 ``VERSION`` 文件里手写一次，其余全部从它派生：
+版本号只在仓库根目录的 VERSION 文件里手写一次，其余全部从它派生：
 
 - 后端运行时：本模块读 VERSION（随 Release 包一起分发）
-- 前端构建时：``web/vite.config.ts`` 读 VERSION 注入 ``__STUDIO_VERSION__``
-- dev 预览 mock：``web/src/dev/mockPlugin.ts`` 读 VERSION
-- 打包命名：``scripts/build_plugin.*`` 读 VERSION
-- ``web/package.json`` / ``package-lock.json``：由 ``scripts/bump_version.py`` 经
-  ``npm version`` 派生
+- 前端构建时：web/vite.config.ts 读 VERSION 注入 __STUDIO_VERSION__
+- dev 预览 mock：由 web/vite.config.ts 传参注入（mockPlugin 不自读）
+- 打包命名：scripts/build_plugin.* 读 VERSION
 
-升级版本请用 ``python scripts/bump_version.py <新版本>``，不要手改任何一处；
-``python scripts/check_version.py`` 校验各派生物是否一致（发版前必跑）。
+web/package.json 不声明 version 字段（保持唯一来源），npm run / vite 均正常。
+升级版本请用 python scripts/bump_version.py <新版本>，不要手改任何一处；
+python scripts/check_version.py 校验各派生物是否一致（发版前必跑）。
 """
 
 from __future__ import annotations

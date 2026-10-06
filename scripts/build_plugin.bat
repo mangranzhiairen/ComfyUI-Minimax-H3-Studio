@@ -10,6 +10,8 @@ REM
 REM  Output: dist_package\ComfyUI-MiniMaxH3-Studio_v{version}_{stamp}.zip
 REM  Contents (runtime only): __init__.py, nodes/, studio/, requirements.txt, VERSION, web/dist
 REM  Version comes from the repo-root VERSION file (single source; see scripts\bump_version.py).
+REM  web/package.json deliberately declares no version. Before packing, the script verifies the
+REM  built web/dist bundle embeds the current VERSION, so a stale dist cannot be released.
 REM  Deps: node + npm (for frontend build). zipping uses built-in PowerShell.
 REM ============================================================
 
@@ -20,7 +22,7 @@ set "NO_BUILD="
 if /I "%1"=="--no-build" set "NO_BUILD=1"
 
 REM ---------- read version ----------
-REM 单一来源：仓库根目录 VERSION（升版本用 scripts\bump_version.py，勿手改）
+REM Single source: repo-root VERSION (bump with scripts\bump_version.py; do not hand-edit)
 set "VERSION="
 for /f "usebackq delims=" %%v in ("%ROOT%\VERSION") do if not defined VERSION set "VERSION=%%v"
 if not defined VERSION set "VERSION=0.0.0"
@@ -54,6 +56,17 @@ if not defined NO_BUILD (
         echo   Warning: web\dist\minimax-h3-studio.js missing; --no-build gives empty frontend
     )
 )
+
+REM ---------- verify dist bundle carries the current VERSION ----------
+REM  The frontend version is injected by web/vite.config.ts from the repo-root VERSION.
+REM  --no-build (or edits without a rebuild) is the drift-prone path; fail fast instead of shipping a mismatched package.
+powershell -NoProfile -Command ^
+  "$v=(Get-Content -LiteralPath '%ROOT%\VERSION' -Raw).Trim();" ^
+  "$f='%ROOT%\web\dist\minimax-h3-studio.js';" ^
+  "if(-not (Test-Path -LiteralPath $f)){ Write-Host ('  Missing frontend bundle: ' + $f); exit 1 };" ^
+  "if(-not (Get-Content -LiteralPath $f -Raw).Contains($v)){ Write-Host ('  Version mismatch: bundle does not contain ' + $v + '; rebuild frontend (npm run build)'); exit 1 };" ^
+  "Write-Host ('  Frontend bundle version OK: ' + $v)"
+if errorlevel 1 goto :fail
 
 REM ---------- assemble runtime snapshot + pack (PowerShell) ----------
 echo [2/2] Collecting runtime files and packing ...

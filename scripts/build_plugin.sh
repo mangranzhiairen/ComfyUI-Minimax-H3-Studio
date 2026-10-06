@@ -9,6 +9,8 @@
 # 产物：dist_package/ComfyUI-MiniMaxH3-Studio_v{version}_{时间戳}.zip
 # 内容：仅运行时必需 —— __init__.py、nodes/、studio/、requirements.txt、VERSION、web/dist
 # 版本：来自仓库根目录 VERSION（单一来源；升版本用 scripts/bump_version.py，勿手改）
+#       web/package.json 刻意不声明 version。打包前会校验 web/dist 产物内嵌的版本与 VERSION 一致，
+#       因此过期 dist 无法被误发布。
 # 依赖：node + npm（构建前端需要）、zip 命令（无则回退 tar.gz 并提示）
 #
 set -euo pipefail
@@ -48,6 +50,20 @@ else
     echo "  警告：web/dist/minimax-h3-studio.js 不存在，跳过构建将得到空前端" >&2
   fi
 fi
+
+# ---------- 校验前端产物版本与 VERSION 一致 ----------
+# 前端 __STUDIO_VERSION__ 由 web/vite.config.ts 从根 VERSION 注入；
+# --no-build（或源码改了没重建）最容易漂移，这里直接失败，避免发出前后端版本不一致的包。
+DIST_JS="$ROOT/web/dist/minimax-h3-studio.js"
+if [ ! -f "$DIST_JS" ]; then
+  echo "  前端产物不存在，无法校验版本：$DIST_JS（先 npm run build）" >&2
+  exit 1
+fi
+if ! grep -qF "$VERSION" "$DIST_JS"; then
+  echo "  版本不一致：$DIST_JS 内没有 $VERSION —— 请重新构建前端（npm run build）" >&2
+  exit 1
+fi
+echo "  前端产物版本 OK：$VERSION"
 
 # ---------- 组装运行时快照 ----------
 echo "[2/2] 收集运行时文件并打包 ..."
